@@ -11,30 +11,21 @@ At solver step `i`, let:
 
 The EMA reference is updated as:
 
-\[
-m_{i+1} = \beta m_i + (1-\beta) v_i
-\]
+`m_{i+1} = β m_i + (1 − β) v_i`
 
 with the first step initialized from the first observed velocity.
 
 The base temporal velocity disagreement is:
 
-\[
-d_i = 1 - \cos(v_i, m_i)
-= 1 - \frac{\langle v_i, m_i \rangle}{\|v_i\|\|m_i\| + \varepsilon}
-\]
+`d_i = 1 − cos(v_i, m_i) = 1 − <v_i, m_i> / (||v_i|| ||m_i|| + ε)`
 
 The residual magnitude is:
 
-\[
-r_i = \|v_i - m_i\|_2
-\]
+`r_i = ||v_i − m_i||_2`
 
 The current method uses the hybrid signal:
 
-\[
-h_i = r_i \cdot d_i
-\]
+`h_i = r_i · d_i`
 
 ## How It Works
 
