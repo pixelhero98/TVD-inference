@@ -1,4 +1,4 @@
-# TVD-Sampler
+# TVD-Scheduler
 
 ## Hybrid Temporal Velocity Disagreement
 
