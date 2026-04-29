@@ -1,0 +1,24 @@
+# One-shot conda environment for the TVD-Scheduler handoff bundle.
+# This mirrors the active remote study as closely as possible:
+# - Python 3.11
+# - PyTorch 2.10 with CUDA 13.0
+# - numpy 2.4.2
+#
+# Create with:
+#   conda env create -f environment.conda.yml
+
+name: tvd-scheduler
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy=2.4.2
+  - matplotlib>=3.8,<4
+  - pytorch=2.10.*
+  - pytorch-cuda=13.0
+  - pip:
+      - wfdb>=4.1
+      - pyedflib>=0.1.38

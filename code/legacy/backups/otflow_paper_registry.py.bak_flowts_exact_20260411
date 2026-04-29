@@ -1,0 +1,482 @@
+from __future__ import annotations
+
+import json
+import math
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+
+
+MAIN_NFE_VALUES: Tuple[int, ...] = (10, 12, 16)
+APPENDIX_NFE_VALUES: Tuple[int, ...] = (6, 8, 20, 24)
+
+TVDP_SCHEDULE_KEY = "tvdp_schedule"
+PAPER_MAIN_SIGNAL_FAMILY = TVDP_SCHEDULE_KEY
+
+_AYS_REFERENCE_TIMESTEPS: Tuple[int, ...] = (999, 850, 736, 645, 545, 455, 343, 233, 124, 24, 0)
+_GITS_REFERENCE_SIGMAS: Tuple[float, ...] = (80.0, 10.9836, 3.8811, 1.5840, 0.5666, 0.1698, 0.0020)
+_OTS_DEFAULT_EPS = 1e-3
+_OTS_LINEAR_BETA_0 = 0.1
+_OTS_LINEAR_BETA_1 = 20.0
+
+
+@dataclass(frozen=True)
+class ScheduleSpec:
+    key: str
+    display_name: str
+    family: str
+    comparison_role: str
+    solver_scope: str
+    implementation_status: str
+    source_url: Optional[str] = None
+    paper_url: Optional[str] = None
+    requires_signal: bool = False
+    external_mapping_status: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SolverSpec:
+    key: str
+    display_name: str
+    order: int
+    family: str
+    implementation_status: str
+    main_matrix_scope: str
+    otflow_runtime_name: Optional[str] = None
+def _catalog_path() -> Path:
+    return Path(__file__).resolve().with_name("otflow_external_schedule_catalog.json")
+
+
+def load_external_schedule_catalog() -> Dict[str, Dict[str, Any]]:
+    payload = json.loads(_catalog_path().read_text(encoding="utf-8"))
+    return {str(key): dict(value) for key, value in payload.items()}
+
+
+def _uniform_grid(n_steps: int) -> Tuple[float, ...]:
+    n_steps = int(n_steps)
+    return tuple(float(idx) / float(n_steps) for idx in range(n_steps + 1))
+
+
+def _late_power_grid(n_steps: int, power: float) -> Tuple[float, ...]:
+    n_steps = int(n_steps)
+    power = float(power)
+    return tuple(1.0 - (1.0 - float(idx) / float(n_steps)) ** power for idx in range(n_steps + 1))
+
+
+def _early_power_grid(n_steps: int, power: float) -> Tuple[float, ...]:
+    n_steps = int(n_steps)
+    power = float(power)
+    return tuple((float(idx) / float(n_steps)) ** power for idx in range(n_steps + 1))
+
+
+def _ensure_monotone(grid: Sequence[float]) -> Tuple[float, ...]:
+    if not grid:
+        raise ValueError("Grid must contain at least one point.")
+    out: List[float] = [float(grid[0])]
+    for value in grid[1:]:
+        current = float(value)
+        if current <= out[-1]:
+            current = min(1.0, out[-1] + 1e-6)
+        out.append(current)
+    out[0] = 0.0
+    out[-1] = 1.0
+    return tuple(out)
+
+
+def _resample_reference_progression(progression: Sequence[float], n_steps: int) -> Tuple[float, ...]:
+    ref = np.asarray(progression, dtype=np.float64)
+    if ref.ndim != 1 or ref.size < 2:
+        raise ValueError("Reference progression must be one-dimensional with at least two points.")
+    src = np.linspace(0.0, 1.0, ref.size)
+    dst = np.linspace(0.0, 1.0, int(n_steps) + 1)
+    resampled = np.interp(dst, src, ref)
+    return _ensure_monotone(resampled.tolist())
+
+
+def _normalize_descending_reference(values: Sequence[float], *, log_space: bool) -> Tuple[float, ...]:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim != 1 or arr.size < 2:
+        raise ValueError("Expected a one-dimensional reference sequence.")
+    safe = np.clip(arr, 1e-12, None)
+    anchor = np.log(safe) if log_space else safe
+    span = float(anchor[0] - anchor[-1])
+    if abs(span) < 1e-12:
+        raise ValueError("Reference sequence must have non-zero span.")
+    progression = (float(anchor[0]) - anchor) / span
+    progression[0] = 0.0
+    progression[-1] = 1.0
+    return _ensure_monotone(progression.tolist())
+
+
+def _ays_reference_progression() -> Tuple[float, ...]:
+    return _normalize_descending_reference(_AYS_REFERENCE_TIMESTEPS, log_space=False)
+
+
+def _gits_reference_progression() -> Tuple[float, ...]:
+    return _normalize_descending_reference(_GITS_REFERENCE_SIGMAS, log_space=True)
+
+
+class _NoiseScheduleVP:
+    """Minimal VP schedule wrapper adapted from the official OTS repo."""
+
+    def __init__(
+        self,
+        *,
+        continuous_beta_0: float = _OTS_LINEAR_BETA_0,
+        continuous_beta_1: float = _OTS_LINEAR_BETA_1,
+    ):
+        self.beta_0 = float(continuous_beta_0)
+        self.beta_1 = float(continuous_beta_1)
+        self.T = 1.0
+
+    def marginal_log_mean_coeff(self, t: torch.Tensor) -> torch.Tensor:
+        return -0.25 * t ** 2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
+
+    def marginal_alpha(self, t: torch.Tensor) -> torch.Tensor:
+        return torch.exp(self.marginal_log_mean_coeff(t))
+
+    def marginal_std(self, t: torch.Tensor) -> torch.Tensor:
+        return torch.sqrt(torch.clamp(1.0 - torch.exp(2.0 * self.marginal_log_mean_coeff(t)), min=1e-12))
+
+    def marginal_lambda(self, t: torch.Tensor) -> torch.Tensor:
+        alpha = self.marginal_alpha(t)
+        sigma = self.marginal_std(t)
+        return torch.log(torch.clamp(alpha / sigma, min=1e-12))
+
+    def inverse_lambda(self, lamb: torch.Tensor) -> torch.Tensor:
+        lamb = lamb.to(dtype=torch.float64)
+        tmp = 2.0 * (self.beta_1 - self.beta_0) * torch.logaddexp(-2.0 * lamb, torch.zeros((1,), dtype=lamb.dtype, device=lamb.device))
+        delta = self.beta_0 ** 2 + tmp
+        denom = torch.sqrt(delta) + self.beta_0
+        return tmp / torch.clamp(denom * (self.beta_1 - self.beta_0), min=1e-12)
+
+
+class _OtsStepOptim:
+    """Source-grounded OTS objective with a lightweight deterministic optimizer."""
+
+    def __init__(self):
+        self.ns = _NoiseScheduleVP()
+        self.T = 1.0
+
+    def alpha(self, t: Sequence[float]) -> np.ndarray:
+        t_t = torch.as_tensor(t, dtype=torch.float64)
+        return self.ns.marginal_alpha(t_t).detach().cpu().numpy()
+
+    def sigma(self, t: Sequence[float]) -> np.ndarray:
+        alpha = self.alpha(t)
+        return np.sqrt(np.clip(1.0 - alpha * alpha, 1e-12, None))
+
+    def lambda_func(self, t: Sequence[float]) -> np.ndarray:
+        alpha = self.alpha(t)
+        sigma = self.sigma(t)
+        return np.log(np.clip(alpha / sigma, 1e-12, None))
+
+    def inverse_lambda(self, lamb: Sequence[float]) -> np.ndarray:
+        lamb_t = torch.as_tensor(lamb, dtype=torch.float64)
+        return self.ns.inverse_lambda(lamb_t).detach().cpu().numpy()
+
+    def H0(self, h: np.ndarray) -> np.ndarray:
+        return np.exp(h) - 1.0
+
+    def H1(self, h: np.ndarray) -> np.ndarray:
+        return np.exp(h) * h - self.H0(h)
+
+    def H2(self, h: np.ndarray) -> np.ndarray:
+        return np.exp(h) * h * h - 2.0 * self.H1(h)
+
+    def sel_lambdas_lof_obj(self, lambda_vec: Sequence[float], eps: float) -> float:
+        lambda_eps = float(self.lambda_func([eps])[0])
+        lambda_T = float(self.lambda_func([self.T])[0])
+        lambda_vec_ext = np.concatenate(([lambda_T], np.asarray(lambda_vec, dtype=np.float64), [lambda_eps]))
+        num_intervals = len(lambda_vec_ext) - 1
+        hv = np.diff(lambda_vec_ext)
+        emlv_sq = np.exp(-2.0 * lambda_vec_ext)
+        alpha_vec = 1.0 / np.sqrt(1.0 + emlv_sq)
+        sigma_vec = 1.0 / np.sqrt(1.0 + np.exp(2.0 * lambda_vec_ext))
+        data_err_vec = (sigma_vec ** 2) / np.clip(alpha_vec, 1e-12, None)
+        trunc_num = 3
+        res = 0.0
+        c_vec = np.zeros(num_intervals, dtype=np.float64)
+        elv = np.exp(lambda_vec_ext)
+        for s in range(num_intervals):
+            if s in (0, num_intervals - 1):
+                n = s
+                coeff = elv[n + 1] - elv[n]
+                res += abs(coeff * data_err_vec[n])
+            elif s in (1, num_intervals - 2):
+                n = s - 1
+                j0 = -elv[n + 1] * self.H1(hv[n + 1]) / max(hv[n], 1e-12)
+                j1 = elv[n + 1] * (self.H1(hv[n + 1]) + hv[n] * self.H0(hv[n + 1])) / max(hv[n], 1e-12)
+                if s >= trunc_num:
+                    c_vec[n] += data_err_vec[n] * j0
+                    c_vec[n + 1] += data_err_vec[n + 1] * j1
+                else:
+                    res += math.sqrt((data_err_vec[n] * j0) ** 2 + (data_err_vec[n + 1] * j1) ** 2)
+            else:
+                n = s - 2
+                denom0 = max(hv[n] * (hv[n] + hv[n + 1]), 1e-12)
+                denom1 = max(hv[n] * hv[n + 1], 1e-12)
+                denom2 = max(hv[n + 1] * (hv[n] + hv[n + 1]), 1e-12)
+                j0 = elv[n + 2] * (self.H2(hv[n + 2]) + hv[n + 1] * self.H1(hv[n + 2])) / denom0
+                j1 = -elv[n + 2] * (self.H2(hv[n + 2]) + (hv[n] + hv[n + 1]) * self.H1(hv[n + 2])) / denom1
+                j2 = (
+                    elv[n + 2]
+                    * (
+                        self.H2(hv[n + 2])
+                        + (2.0 * hv[n + 1] + hv[n]) * self.H1(hv[n + 2])
+                        + hv[n + 1] * (hv[n] + hv[n + 1]) * self.H0(hv[n + 2])
+                    )
+                    / denom2
+                )
+                if s >= trunc_num:
+                    c_vec[n] += data_err_vec[n] * j0
+                    c_vec[n + 1] += data_err_vec[n + 1] * j1
+                    c_vec[n + 2] += data_err_vec[n + 2] * j2
+                else:
+                    res += math.sqrt(
+                        (data_err_vec[n] * j0) ** 2
+                        + (data_err_vec[n + 1] * j1) ** 2
+                        + (data_err_vec[n + 2] * j2) ** 2
+                    )
+        res += float(np.sum(np.abs(c_vec)))
+        return float(res)
+
+    def _coordinate_descent(self, lambda_init: np.ndarray, eps: float) -> np.ndarray:
+        current = np.asarray(lambda_init, dtype=np.float64).copy()
+        if current.size == 0:
+            return current
+        for _ in range(8):
+            changed = False
+            for idx in range(current.size):
+                left = float(self.lambda_func([self.T])[0]) if idx == 0 else current[idx - 1]
+                right = float(self.lambda_func([eps])[0]) if idx == current.size - 1 else current[idx + 1]
+                lower = right + 1e-5
+                upper = left - 1e-5
+                if not upper > lower:
+                    continue
+                candidates = np.linspace(lower, upper, 31, dtype=np.float64)
+                best_value = current[idx]
+                best_obj = self.sel_lambdas_lof_obj(current, eps)
+                trial = current.copy()
+                for candidate in candidates:
+                    trial[idx] = float(candidate)
+                    score = self.sel_lambdas_lof_obj(trial, eps)
+                    if score < best_obj:
+                        best_obj = score
+                        best_value = float(candidate)
+                if abs(best_value - current[idx]) > 1e-9:
+                    current[idx] = best_value
+                    changed = True
+            if not changed:
+                break
+        return current
+
+    def get_ts_lambdas(self, n_steps: int, eps: float = _OTS_DEFAULT_EPS) -> Tuple[np.ndarray, np.ndarray]:
+        lambda_eps = float(self.lambda_func([eps])[0])
+        lambda_T = float(self.lambda_func([self.T])[0])
+        t_vec = np.linspace(self.T, eps, int(n_steps) + 1, dtype=np.float64)
+        lambda_vec_ext = self.lambda_func(t_vec)
+        lambda_init = np.asarray(lambda_vec_ext[1:-1], dtype=np.float64)
+        lambda_opt = self._coordinate_descent(lambda_init, eps)
+        lambda_res = np.concatenate(([lambda_T], lambda_opt, [lambda_eps]))
+        t_res = self.inverse_lambda(lambda_res)
+        t_res[0] = self.T
+        t_res[-1] = eps
+        return t_res, lambda_res
+
+
+def _ots_reference_progression(n_steps: int) -> Tuple[float, ...]:
+    optim = _OtsStepOptim()
+    t_res, _ = optim.get_ts_lambdas(int(n_steps), eps=_OTS_DEFAULT_EPS)
+    progression = (float(optim.T) - t_res) / max(float(optim.T - _OTS_DEFAULT_EPS), 1e-12)
+    progression[0] = 0.0
+    progression[-1] = 1.0
+    return _ensure_monotone(progression.tolist())
+
+
+def build_schedule_grid(schedule_key: str, n_steps: int) -> Optional[Tuple[float, ...]]:
+    key = str(schedule_key).strip().lower()
+    if key == "uniform":
+        return _ensure_monotone(_uniform_grid(n_steps))
+    if key == "late_power_2":
+        return _ensure_monotone(_late_power_grid(n_steps, power=2.0))
+    if key == "late_power_3":
+        return _ensure_monotone(_late_power_grid(n_steps, power=3.0))
+    if key == "early_biased_control":
+        return _ensure_monotone(_early_power_grid(n_steps, power=2.0))
+    if key == "ays":
+        return _resample_reference_progression(_ays_reference_progression(), int(n_steps))
+    if key == "gits":
+        return _resample_reference_progression(_gits_reference_progression(), int(n_steps))
+    if key == "ots":
+        return _ots_reference_progression(int(n_steps))
+    return None
+
+
+def paper_schedule_specs() -> List[ScheduleSpec]:
+    external_catalog = load_external_schedule_catalog()
+    return [
+        ScheduleSpec(
+            key="uniform",
+            display_name="Time-uniform",
+            family="uniform",
+            comparison_role="baseline_uniform",
+            solver_scope="all",
+            implementation_status="implemented",
+        ),
+        ScheduleSpec(
+            key="late_power_2",
+            display_name="Late-power-2",
+            family="hand_designed",
+            comparison_role="generic_fixed_schedule",
+            solver_scope="all_fixed_grid_ode",
+            implementation_status="implemented",
+        ),
+        ScheduleSpec(
+            key="late_power_3",
+            display_name="Late-power-3",
+            family="hand_designed",
+            comparison_role="generic_fixed_schedule",
+            solver_scope="all_fixed_grid_ode",
+            implementation_status="implemented",
+        ),
+        ScheduleSpec(
+            key="early_biased_control",
+            display_name="Early-biased control",
+            family="hand_designed",
+            comparison_role="generic_fixed_schedule",
+            solver_scope="all_fixed_grid_ode",
+            implementation_status="implemented",
+        ),
+        ScheduleSpec(
+            key="ays",
+            display_name="AYS",
+            family="published_mapped",
+            comparison_role="published_fixed_schedule",
+            solver_scope="euler_only_main_matrix",
+            implementation_status="implemented",
+            source_url=external_catalog["ays"]["source_url"],
+            paper_url=external_catalog["ays"]["paper_url"],
+            external_mapping_status=external_catalog["ays"]["mapping_status"],
+        ),
+        ScheduleSpec(
+            key="gits",
+            display_name="GITS",
+            family="published_mapped",
+            comparison_role="published_fixed_schedule",
+            solver_scope="euler_only_main_matrix",
+            implementation_status="implemented",
+            source_url=external_catalog["gits"]["source_url"],
+            paper_url=external_catalog["gits"]["paper_url"],
+            external_mapping_status=external_catalog["gits"]["mapping_status"],
+        ),
+        ScheduleSpec(
+            key="ots",
+            display_name="OTS",
+            family="published_mapped",
+            comparison_role="published_fixed_schedule",
+            solver_scope="euler_only_main_matrix",
+            implementation_status="implemented",
+            source_url=external_catalog["ots"]["source_url"],
+            paper_url=external_catalog["ots"]["paper_url"],
+            external_mapping_status=external_catalog["ots"]["mapping_status"],
+        ),
+        ScheduleSpec(
+            key=TVDP_SCHEDULE_KEY,
+            display_name="TVD-p schedule",
+            family="offline_signal",
+            comparison_role="paper_method",
+            solver_scope="all_fixed_grid_ode",
+            implementation_status="implemented",
+            requires_signal=True,
+        ),
+    ]
+
+
+def paper_solver_specs() -> List[SolverSpec]:
+    return [
+        SolverSpec(
+            key="euler",
+            display_name="Euler",
+            order=1,
+            family="deterministic_ode",
+            implementation_status="available",
+            main_matrix_scope="all_schedules",
+            otflow_runtime_name="euler",
+        ),
+        SolverSpec(
+            key="heun",
+            display_name="Heun / RK2",
+            order=2,
+            family="deterministic_ode",
+            implementation_status="available",
+            main_matrix_scope="all_nonmapped_schedules",
+            otflow_runtime_name="heun",
+        ),
+        SolverSpec(
+            key="midpoint_rk2",
+            display_name="Midpoint RK2",
+            order=2,
+            family="deterministic_ode",
+            implementation_status="available",
+            main_matrix_scope="all_nonmapped_schedules",
+            otflow_runtime_name="midpoint_rk2",
+        ),
+        SolverSpec(
+            key="dopri5",
+            display_name="Dopri5 / Dormand-Prince",
+            order=5,
+            family="deterministic_ode",
+            implementation_status="available",
+            main_matrix_scope="all_nonmapped_schedules",
+            otflow_runtime_name="dopri5",
+        ),
+        SolverSpec(
+            key="rk45",
+            display_name="RK45 / Runge-Kutta45",
+            order=5,
+            family="deterministic_ode",
+            implementation_status="available",
+            main_matrix_scope="all_nonmapped_schedules",
+            otflow_runtime_name="rk45",
+        ),
+        # DPM++2M in this transfer path is treated as the second-order multistep variant.
+        SolverSpec(
+            key="dpmpp2m",
+            display_name="DPM++2M",
+            order=2,
+            family="multistep_ode",
+            implementation_status="available",
+            main_matrix_scope="solver_transfer",
+            otflow_runtime_name="dpmpp2m",
+        ),
+    ]
+
+
+def paper_registry_snapshot() -> Dict[str, Any]:
+    return {
+        "main_nfe_values": list(MAIN_NFE_VALUES),
+        "appendix_nfe_values": list(APPENDIX_NFE_VALUES),
+        "paper_main_method_family": PAPER_MAIN_SIGNAL_FAMILY,
+        "paper_main_signal_family": PAPER_MAIN_SIGNAL_FAMILY,
+        "schedules": [asdict(spec) for spec in paper_schedule_specs()],
+        "solvers": [asdict(spec) for spec in paper_solver_specs()],
+    }
+
+
+__all__ = [
+    "APPENDIX_NFE_VALUES",
+    "MAIN_NFE_VALUES",
+    "PAPER_MAIN_SIGNAL_FAMILY",
+    "ScheduleSpec",
+    "SolverSpec",
+    "build_schedule_grid",
+    "load_external_schedule_catalog",
+    "paper_registry_snapshot",
+    "paper_schedule_specs",
+    "paper_solver_specs",
+    "TVDP_SCHEDULE_KEY",
+]

@@ -1,0 +1,318 @@
+# OTFlow Schedule Paper Plan
+
+This is the canonical experiment plan for the `TVD-Scheduler` project.
+
+## Thesis
+
+The paper studies fixed-grid inference schedules under a shared backbone and asks how scheduler choice changes performance at matched realized NFE.
+
+The main contribution is the **scheduler**. Backbone comparisons are a supporting lane used to strengthen the evaluation story, not to redefine the core paper claim.
+
+## Main Scope
+
+- Active scheduler study on `yzn3090`:
+  - `tvdp_interpolated`
+  - `tvdp_unified`
+- Backward-compatible alias:
+  - `tvdp_schedule` maps to `tvdp_interpolated` in legacy prep and registry paths
+- Legacy appendix-only method:
+  - `legacy_hybrid_signal`
+- Main fixed-grid ODE solvers:
+  - `Euler`
+  - `Heun / RK2`
+  - `Midpoint RK2`
+  - `Dopri5 / Dormand-Prince`
+  - `RK45 / Runge-Kutta45`
+- Solver-transfer only:
+  - `DPM++2M`
+
+`Dopri5` and `RK45` are treated only as fixed-grid explicit integrators on prescribed schedule knots. If adaptive internal step-size control is enabled, that becomes a separate experiment family.
+
+## Backbone Lanes
+
+### OTFlow
+
+- Canonical scheduler backbone for the canonical 9-dataset paper scope
+- Used for:
+  - the active TVD scheduler study
+  - main-table baseline comparisons
+  - the essential appendix package
+- Shared checkpoint package:
+  - `results_otflow_shared_backbone_training_fullhorizon_seed0_20260406`
+- Checkpoint-ready runnable defaults remain the original 7 datasets until the ECG and Sleep-EDF shared checkpoints are produced
+
+### TSFlow
+
+- Forecast-only co-primary backbone for the original 5 non-medical extrapolation datasets
+- Trained and evaluated on separate machines so it can proceed in parallel with OTFlow scheduler jobs
+- Used first as a backbone-strengthening lane, not yet as a scheduler-comparison lane
+- Scheduler-grid integration for TSFlow is deferred to a later adapter step
+
+## Benchmark Families
+
+### Forecast Extrapolation
+
+- `wind_farms_wo_missing`
+- `san_francisco_traffic`
+- `london_smart_meters_wo_missing`
+- `electricity`
+- `solar_energy_10m`
+- `long_term_headered_ECG_records`
+
+### LOB Conditional Generation
+
+- `cryptos`
+- `es_mbp_10`
+- `sleep_edf`
+
+## Locked Dataset Setup
+
+All main experiments use horizon-wise non-AR rollout, so:
+
+\[
+\text{future\_block\_len} = \text{experiment\_horizon}
+\]
+
+This avoids chunk-stitching effects and keeps scheduler comparisons fair.
+
+| Dataset | Family | History Length | Horizon | Future Block Length | Axis |
+|---|---|---:|---:|---:|---|
+| `wind_farms_wo_missing` | Forecast | 1440 | 1440 | 1440 | physical time |
+| `san_francisco_traffic` | Forecast | 336 | 168 | 168 | physical time |
+| `london_smart_meters_wo_missing` | Forecast | 672 | 336 | 336 | physical time |
+| `electricity` | Forecast | 336 | 168 | 168 | physical time |
+| `solar_energy_10m` | Forecast | 1008 | 1008 | 1008 | physical time |
+| `long_term_headered_ECG_records` | Forecast | 2000 | 1000 | 1000 | physical time |
+| `cryptos` | LOB | 256 | 200 | 200 | event count |
+| `es_mbp_10` | LOB | 256 | 200 | 200 | event count |
+| `sleep_edf` | LOB | 12000 | 3000 | 3000 | physical time |
+
+## Data Splits and Normalization
+
+### Forecast
+
+- Split policy is chronological and horizon-clean per series:
+  - `test = final H`
+  - `val = penultimate H`
+  - `train = all earlier points`
+- Normalization is per-series z-score fit on the training prefix only
+- If the train-prefix variance is tiny, center only and use scale `1.0`
+
+### LOB
+
+- Split policy is chronological and segment-safe:
+  - `train / val / test = 0.7 / 0.1 / 0.2`
+- Normalization is dataset-level per-channel standardization fit on the train split only
+
+## Irregular-Time Support
+
+The OTFlow backbone supports timestamp-aware context encoding in a domain-generic way.
+
+History context tokens may include:
+
+- `log_gap`: log-scaled elapsed gap from the previous observation
+- `elapsed_time`: normalized cumulative elapsed time within the current history window
+
+In non-AR mode, future templates may also include:
+
+- future gap sequence
+- future normalized elapsed-time sequence
+
+No calendar, time-of-day, or market-specific features are used.
+
+## Backbone Training Recipes
+
+### OTFlow Forecast Family
+
+- `hidden_dim = 128`
+- `ctx_encoder = "hybrid"`
+- context encoder: `2 layers x 4 heads`
+- field network: `transformer`, `2 layers x 4 heads`
+- `dropout = 0.1`
+- `steps = 20000`
+
+### OTFlow LOB Family
+
+- `hidden_dim = 160`
+- `ctx_encoder = "hybrid"`
+- context encoder: `2 layers x 4 heads`
+- field network: `transformer`, `3 layers x 4 heads`
+- `dropout = 0.1`
+- `steps = 20000`
+
+### Shared OTFlow Training Hyperparameters
+
+- optimizer: `AdamW`
+- learning rate: `2e-4`
+- weight decay: `1e-4`
+- grad clip: `1.0`
+- EMA decay: `0.999`
+- cosine schedule with warmup
+- AMP enabled
+- gradient accumulation enabled
+- time features enabled where timestamps are available
+
+## Evaluation Protocol
+
+### Main NFE Budgets
+
+- `10`
+- `12`
+- `16`
+
+### Appendix NFE Budgets
+
+- `6`
+- `8`
+- `20`
+- `24`
+
+### Active TVD Scheduler Study
+
+- `tvdp_interpolated`
+- `tvdp_unified`
+
+This remains the active scheduler-selection lane on `yzn3090`.
+
+### Main OTFlow Baseline Scope
+
+- Datasets:
+  - canonical paper scope is all 9 datasets
+  - checkpoint-ready execution defaults remain the original 7 datasets until shared ECG and Sleep-EDF checkpoints are available
+- Solvers:
+  - `euler`
+  - `heun`
+  - `midpoint_rk2`
+  - `dopri5`
+  - `rk45`
+  - `dpmpp2m` labeled `solver_transfer`
+- Baseline schedules:
+  - `uniform`
+  - `late_power_2`
+  - `late_power_3`
+  - `early_biased_control`
+  - `ays`, `gits`, `ots` for Euler-only rows
+
+### Essential Appendix Package
+
+- Representative NFE sweep over:
+  - `6`
+  - `8`
+  - `10`
+  - `12`
+  - `16`
+  - `20`
+  - `24`
+- Schedules included in the appendix sweep:
+  - `uniform`
+  - one selected hand-designed baseline per family
+  - `ays`, `gits`, `ots` for Euler-only appendix rows
+  - the winning TVD scheduler(s) after the active TVD study locks deltas
+- Latency appendix is reported as frontier/Pareto summaries, not exhaustive raw latency tables
+- `dpmpp2m` remains visible but always labeled `solver_transfer`
+- `legacy_hybrid_signal` remains appendix-only and LOB-only
+
+### Hand-Designed Baseline Selection Rule
+
+Choose one hand-designed baseline per family using validation mean-rank across `dataset x solver x main-NFE`, with tie-breaks:
+
+1. better raw mean primary metric
+2. `late_power_2`
+3. `late_power_3`
+4. `early_biased_control`
+
+### Delta Tuning Protocol
+
+- Tune `delta` per family, not per solver or per dataset
+- Forecast delta grid:
+  - `0.05`
+  - `0.10`
+  - `0.25`
+- LOB delta grid:
+  - `0.10`
+  - `0.25`
+  - `0.50`
+- Delta selection is validation only
+- For each TVD scheduler and family, choose the delta with the best mean rank across `dataset x solver x NFE`
+- Tie-breaks:
+  - better raw mean primary metric
+  - smaller delta
+
+## Main Metrics
+
+### Forecast Extrapolation
+
+Primary metrics:
+
+- `relative_crps_gain_vs_uniform`
+- `MASE`
+
+Main-table reporting rule:
+
+- `relative_crps_gain_vs_uniform = 1 - CRPS_scheduler / CRPS_uniform`, computed per matched
+  `dataset x solver x NFE x backbone` cell and averaged only after the per-cell ratio/gain is formed
+- `MASE` is reported as a scale-free absolute forecast metric on the scheduler output
+- raw `CRPS` and raw `MSE` remain appendix metrics, not the headline cross-dataset table values
+
+Supporting system metrics:
+
+- `realized_nfe`
+- `latency_ms_per_sample`
+
+### LOB Conditional Generation
+
+Primary metrics:
+
+- `relative_score_gain_vs_uniform`
+
+Main-table reporting rule:
+
+- `relative_score_gain_vs_uniform = 1 - score_main_scheduler / score_main_uniform`, computed per matched
+  `dataset x solver x NFE x backbone` cell and averaged only after the per-cell ratio/gain is formed
+- raw `score_main` remains appendix-visible for absolute-scale inspection, but not as the main cross-scenario headline
+
+Supporting system metrics:
+
+- `realized_nfe`
+- `latency_ms_per_sample`
+
+Full conditional-generation metrics remain appendix / follow-up material.
+
+## Reporting Policy
+
+- Main tables use relative or scale-free metrics so gains are comparable across datasets and scenarios
+- Appendix tables keep the raw-scale metrics for interpretability and auditability
+- Forecast main tables:
+  - `relative_crps_gain_vs_uniform`
+  - `MASE`
+- Forecast appendix tables:
+  - raw `CRPS`
+  - raw `MSE`
+- LOB main tables:
+  - `relative_score_gain_vs_uniform`
+- LOB appendix tables:
+  - raw `score_main`
+  - the fuller conditional-generation metric breakdown when needed
+- Relative metrics are always computed against the matched `uniform` baseline row with the same
+  `dataset`, `solver`, `target_nfe`, `backbone`, and evaluation split
+- When summarizing across cells, average the already-computed per-cell relative metrics or ranks;
+  do not divide global means of raw metrics
+
+## Current Execution State
+
+- Shared OTFlow backbone training has completed across the checkpoint-ready 7 datasets under:
+  - `results_otflow_shared_backbone_training_fullhorizon_seed0_20260406`
+- The completed OTFlow checkpoints are consolidated under `TVD-Scheduler/results`
+- The active TVD scheduler study is running on `yzn3090`
+- OTFlow baseline production and TSFlow pretraining are intended to run on other machines in parallel
+- No quantizer redesign is in scope for the active TVD phase; improvement there means delta tuning only
+- The active TVD-only run is a scheduler-screening lane; final main-table reporting still requires the
+  matched `uniform` baseline rows so relative metrics can be formed
+
+## Next Experimental Steps
+
+1. Finish the active TVD delta-tuning and locked-test run on `yzn3090`
+2. Launch OTFlow baseline main-table runs on other machines from the shared 7-checkpoint package
+3. Launch the essential appendix package on other machines
+4. Start TSFlow forecast-only pretraining on other machines
+5. Add a later TSFlow adapter layer so TSFlow outputs can be reported in the same summary/table schema with explicit `backbone_name`

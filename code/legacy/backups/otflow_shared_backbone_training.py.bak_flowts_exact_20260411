@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Train the shared OTFlow backbones for the paper datasets."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Any, Dict
+
+import torch
+
+from otflow_experiment_plan import CHECKPOINT_READY_FORECAST_DATASETS, CHECKPOINT_READY_LOB_PAPER_DATASETS
+from otflow_forecast_extrapolation import run_forecast_extrapolation
+from otflow_lob_conditional_generation_paper import run_lob_backbone_training
+from otflow_medical_datasets import default_sleep_edf_data_path
+from otflow_train_val import save_json
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description="Train the shared OTFlow backbones for the paper datasets.")
+    ap.add_argument("--dataset_root", type=str, default="paper_datasets")
+    ap.add_argument("--out_root", type=str, default="results_otflow_shared_backbone_training")
+    ap.add_argument(
+        "--forecast_datasets",
+        type=str,
+        default=",".join(CHECKPOINT_READY_FORECAST_DATASETS),
+    )
+    ap.add_argument("--lob_datasets", type=str, default=",".join(CHECKPOINT_READY_LOB_PAPER_DATASETS))
+    ap.add_argument("--cryptos_path", type=str, default="")
+    ap.add_argument("--es_path", type=str, default="")
+    ap.add_argument("--sleep_edf_path", type=str, default=default_sleep_edf_data_path())
+    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--dataset_seed", type=int, default=0)
+    ap.add_argument("--steps", type=int, default=0)
+    ap.add_argument("--log_every", type=int, default=200)
+    ap.add_argument("--num_eval_samples", type=int, default=25)
+    ap.add_argument("--sample_nfe", type=int, default=16)
+    ap.add_argument("--resume", action="store_true", default=True)
+    ap.add_argument("--no_resume", dest="resume", action="store_false")
+    ap.add_argument("--allow_execute", action="store_true", default=False)
+    return ap
+
+
+def run_shared_backbone_training(cli_args: argparse.Namespace) -> Dict[str, Any]:
+    out_root = Path(str(cli_args.out_root)).resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    forecast_summary = run_forecast_extrapolation(
+        argparse.Namespace(
+            dataset_root=str(cli_args.dataset_root),
+            out_root=str((out_root / "forecast").resolve()),
+            datasets=str(cli_args.forecast_datasets),
+            validation_policy="single_tail_holdout",
+            num_eval_samples=int(cli_args.num_eval_samples),
+            sample_nfe=int(cli_args.sample_nfe),
+            seed=int(cli_args.seed),
+            device=str(cli_args.device),
+            steps=int(cli_args.steps),
+            log_every=int(cli_args.log_every),
+            resume=bool(cli_args.resume),
+            allow_execute=bool(cli_args.allow_execute),
+        )
+    )
+    lob_summary = run_lob_backbone_training(
+        argparse.Namespace(
+            out_root=str((out_root / "lob").resolve()),
+            datasets=str(cli_args.lob_datasets),
+            cryptos_path=str(cli_args.cryptos_path),
+            es_path=str(cli_args.es_path),
+            sleep_edf_path=str(cli_args.sleep_edf_path),
+            cryptos_checkpoint_source="",
+            es_checkpoint_source="",
+            sleep_edf_checkpoint_source="",
+            checkpoint_import_root="",
+            seed=int(cli_args.seed),
+            dataset_seed=int(cli_args.dataset_seed),
+            device=str(cli_args.device),
+            steps=int(cli_args.steps),
+            log_every=int(cli_args.log_every),
+            eval_horizon=0,
+            eval_windows_val=0,
+            eval_windows_test=0,
+            target_nfe_values="10,12,16",
+            solver_names="euler,heun,midpoint_rk2,dopri5,rk45",
+            schedule_names="uniform,late_power_2,late_power_3,early_biased_control,ays,gits,ots,tvdp_schedule",
+            latency_trials=1,
+            latency_warmup=0,
+            row_jsonl_name="comparison_rows.jsonl",
+            row_csv_name="comparison_rows.csv",
+            resume=bool(cli_args.resume),
+            score_main_only=True,
+            hidden_dim=160,
+            fu_net_layers=3,
+            fu_net_heads=4,
+            rollout_mode="non_ar",
+            future_block_len=0,
+            lr=2e-4,
+            weight_decay=1e-4,
+            grad_clip=1.0,
+            field_network_type="transformer",
+            allow_execute=bool(cli_args.allow_execute),
+        )
+    )
+    payload = {
+        "benchmark_family": "shared_backbone_training",
+        "forecast": forecast_summary,
+        "lob": lob_summary,
+    }
+    save_json(payload, str((out_root / "shared_backbone_training_summary.json").resolve()))
+    return payload
+
+
+def main() -> None:
+    run_shared_backbone_training(build_argparser().parse_args())
+
+
+if __name__ == "__main__":
+    main()

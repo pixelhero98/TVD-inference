@@ -1,47 +1,81 @@
-# TVD-Scheduler
+# Diffusion-Flow Time Reparameterization
 
-## Hybrid Temporal Velocity Disagreement
+This project now studies transfer/conversion of optimized diffusion schedules into flow-time schedules for OTFlow backbones. The active paper position is **diffusion-flow time reparameterization**: keep the velocity-field/context-encoder backbone fixed, map diffusion schedules onto normalized flow time, and measure whether those schedules improve deterministic and adaptive solver behavior.
 
-The current implementation uses a hybrid temporal velocity disagreement signal computed from the rollout velocity field of a frozen `OTFlow` model.
+`TVD-result` is intentionally still used as a stable storage path during this cleanup. It should be read as legacy storage naming, not as the active paper method.
 
-At solver step `i`, let:
+## Active Code Path
 
-- `v_i` be the current flattened velocity field
-- `m_i` be an exponential moving average of past velocities
+- `code/diffusion_flow_time_reparameterization.py`: active fixed-schedule evaluation entrypoint.
+- `code/diffusion_flow_schedules.py`: uniform, late-power-3, AYS, GITS, and OTS schedule construction plus fixed-schedule LOB evaluation support.
+- `code/otflow_evaluation_support.py`: checkpoint loading, split/window resolution, deterministic forecast evaluation, solver mappings, and metric helpers.
+- `code/otflow_paper_registry.py`: active method registry with `diffusion_flow_time_reparameterization`.
+- `code/otflow_model.py`, `code/conditioning.py`, `code/config.py`, `code/modules.py`, datasets, and `code/otflow_train_val.py`: active backbone training core for the velocity-field network and context encoder.
 
-The EMA reference is updated as:
+## Schedules And Solvers
 
-`m_{i+1} = β m_i + (1 − β) v_i`
+Active deterministic schedules:
 
-with the first step initialized from the first observed velocity.
+- `uniform`
+- `late_power_3`
+- `ays`
+- `gits`
+- `ots`
 
-The base temporal velocity disagreement is:
+Transferred optimized diffusion schedules are exactly `ays`, `gits`, and `ots`. `uniform` and `late_power_3` are deterministic baselines and should not be used as transfer candidates for PTG or adaptive target selection.
 
-`d_i = 1 − cos(v_i, m_i) = 1 − <v_i, m_i> / (||v_i|| ||m_i|| + ε)`
+Active deterministic solvers:
 
-The residual magnitude is:
+- `euler`
+- `heun`
+- `midpoint_rk2`
+- `dpmpp2m`
 
-`r_i = ||v_i − m_i||_2`
+Adaptive solver studies remain in `code/build_adaptive_solver_matched_nfe_study.py` for `rk45_adaptive` and `dopri5_adaptive` matched-NFE evaluation.
 
-The current method uses the hybrid signal:
+## Native Hardness And PTG
 
-`h_i = r_i · d_i`
+Native hardness is now the **info-growth** trace, exposed as `info_growth_hardness_by_step` by `code/otflow_signal_traces.py`. PTG and observed-gain tooling should treat info-growth as the paper-facing trace. Local-defect PTG remains available only as a diagnostic variant.
 
-## How It Works
+Use `code/build_ptg_observed_gain_figure.py` for PTG-vs-observed-integration-gain analysis. Use `code/build_hardness_mismatch_figure.py` for the neutral native info-growth trace and schedule-node visualization.
 
-The signal compares the current solver velocity to a temporally smoothed reference direction. It is large when the current step is both:
+## Checkpoints
 
-- directionally inconsistent with the recent rollout trend
-- far from that recent trend in magnitude
+The active checkpoint matrix remains at:
 
-So the signal is not only asking whether the velocity turns, but also whether the turn happens with substantial geometric displacement.
+`TVD-result/results/backbone_matrix/backbone_manifest.json`
 
-In the current paper path, this hybrid temporal velocity disagreement is used **offline**:
+The current manifest is expected to report 40 ready artifacts and 0 missing artifacts, covering the 4k-20k extrapolation and conditional-generation checkpoint matrix.
 
-1. Run validation rollouts with the frozen OTFlow backbone.
-2. Record `h_i` at each solver step.
-3. Average the per-step signal across validation windows.
-4. Convert the averaged signal trace into a fixed nonuniform inference grid.
-5. Reuse that fixed grid at test time for all samples.
+## Legacy Archive
 
-This means the method uses temporal velocity disagreement as a schedule-design statistic, not as an online per-sample trigger.
+Canonical TVD code, the old root `plan.md`, TVD-only support utilities, old imported 12k schedule checkpoints, retired result folders, and non-core extras were moved under:
+
+`legacy/diffusion_flow_reparameterization_cleanup_20260429T180424Z/`
+
+The archive manifest at `legacy/diffusion_flow_reparameterization_cleanup_20260429T180424Z/archive_manifest.json` records original paths, archive paths, sizes, and checksums. Do not delete archived artifacts unless a later cleanup explicitly supersedes this archive.
+
+## Isambard Jobs
+
+Active Isambard fixed-schedule jobs now call `diffusion_flow_time_reparameterization.py`. The broken FM backbone Slurm submission path that referenced the missing `fm_backbone_matrix.py` was archived; use `code/fm_backbone_readiness_audit.py` and the active backbone manifest for readiness checks.
+
+## Tests
+
+Focused tests:
+
+```bash
+cd /home/yzn/work/TVD-Scheduler/code
+../.venv/bin/python -m unittest -q test_backbone_matrix test_otflow_paper_prep test_ptg_observed_gain_figure test_adaptive_solver_matched_nfe_study
+```
+
+Full discovery:
+
+```bash
+cd /home/yzn/work/TVD-Scheduler
+.venv/bin/python -m unittest discover -s code -p "test_*.py"
+```
+
+## Open Points
+
+- The physical directory names `TVD-Scheduler` and `TVD-result` are preserved for path stability. A later migration can rename storage roots after all scripts and external jobs stop depending on those paths.
+- OTS currently uses the existing VP-time optimizer mapping. If the paper needs a different published OTS convention, update `code/diffusion_flow_schedules.py` and the registry together.

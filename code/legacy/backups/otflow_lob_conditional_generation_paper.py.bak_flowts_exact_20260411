@@ -1,0 +1,1469 @@
+#!/usr/bin/env python3
+"""Conditional-generation paper runner for OTFlow schedule experiments."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import math
+import shutil
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+
+import numpy as np
+import torch
+
+from adaptive_deterministic_refinement_followup import _collect_calibration
+from adaptive_noise_sampler_followup import (
+    _apply_sample_overrides,
+    _choose_valid_windows,
+    _restore_sample_overrides,
+    _save_checkpoint,
+)
+from experiment_common import build_cfg_from_args, build_dataset_splits, get_otflow_paper_backbone_preset, mkdir
+from otflow_experiment_plan import (
+    CANONICAL_LOB_PAPER_DATASETS,
+    CHECKPOINT_READY_LOB_PAPER_DATASETS,
+    experiment_plan_by_key,
+)
+from otflow_medical_datasets import SLEEP_EDF_DATASET_KEY, default_sleep_edf_data_path
+from otflow_paths import project_checkpoint_import_root
+from otflow_schedule_utils import run_fixed_schedule_variant, signal_validation_spearman, tvdp_schedule_details
+from otflow_model import OTFlow
+from otflow_train_val import benchmark_sampling_latency, save_json, seed_all, train_loop
+from otflow_paper_registry import (
+    MAIN_NFE_VALUES,
+    TVDP_SCHEDULE_KEY,
+    build_schedule_grid,
+    paper_registry_snapshot,
+)
+from otflow_paper_tables import (
+    build_lob_appendix_table_layout,
+    build_lob_pilot_table_layout,
+    build_lob_table_layout,
+    markdown_header_stub,
+    table_layout_to_dict,
+)
+
+
+CANONICAL_ALLOWED_LOB_PAPER_DATASETS: Tuple[str, ...] = tuple(CANONICAL_LOB_PAPER_DATASETS)
+LOB_PAPER_DATASETS: Tuple[str, ...] = tuple(CHECKPOINT_READY_LOB_PAPER_DATASETS)
+OTFLOW_BACKBONE_PRESET = {
+    "backbone_name": "otflow",
+    "levels": 10,
+    "history_len": 256,
+    "ctx_encoder": "hybrid",
+    "ctx_causal": True,
+    "ctx_local_kernel": 7,
+    "ctx_pool_scales": "8,32",
+}
+DEFAULT_IMPORTED_CHECKPOINT_ROOT = str(project_checkpoint_import_root())
+_TVDP_SIGNAL_TRACE_KEY = "hybrid_signal_by_step"
+_TVDP_DELTA = 0.25
+_TVDP_SIGNAL_FAMILY_NAME = TVDP_SCHEDULE_KEY
+_TVDP_QUANTIZATION_MODE = "interpolated"
+_TVDP_ROW_SIGNATURE_VERSION = "tvdp_schedule_v4"
+EULER_ONLY_MAIN_MATRIX_SCHEDULES: Tuple[str, ...] = ("ays", "gits", "ots")
+MAIN_SCHEDULE_ORDER: Tuple[str, ...] = (
+    "uniform",
+    "late_power_2",
+    "late_power_3",
+    "early_biased_control",
+    "ays",
+    "gits",
+    "ots",
+    TVDP_SCHEDULE_KEY,
+)
+SCHEDULE_ORDER: Tuple[str, ...] = MAIN_SCHEDULE_ORDER
+MAIN_SOLVER_ORDER: Tuple[str, ...] = ("euler", "heun", "midpoint_rk2", "dopri5", "rk45")
+TRANSFER_SOLVER_ORDER: Tuple[str, ...] = ("dpmpp2m",)
+SOLVER_ORDER: Tuple[str, ...] = MAIN_SOLVER_ORDER
+ALL_SOLVER_ORDER: Tuple[str, ...] = MAIN_SOLVER_ORDER + TRANSFER_SOLVER_ORDER
+SCHEDULE_DISPLAY_NAMES: Dict[str, str] = {
+    "uniform": "Time-uniform",
+    "late_power_2": "Late-power-2",
+    "late_power_3": "Late-power-3",
+    "early_biased_control": "Early-biased control",
+    "ays": "AYS",
+    "gits": "GITS",
+    "ots": "OTS",
+    TVDP_SCHEDULE_KEY: "TVD-p schedule",
+}
+SOLVER_RUNTIME_NAMES: Dict[str, str] = {
+    "euler": "euler",
+    "heun": "heun",
+    "midpoint_rk2": "midpoint_rk2",
+    "dopri5": "dopri5",
+    "rk45": "rk45",
+    "dpmpp2m": "dpmpp2m",
+}
+SOLVER_DISPLAY_NAMES: Dict[str, str] = {
+    "euler": "Euler",
+    "heun": "Heun / RK2",
+    "midpoint_rk2": "Midpoint RK2",
+    "dopri5": "Dopri5 / Dormand-Prince",
+    "rk45": "RK45 / Runge-Kutta45",
+    "dpmpp2m": "DPM++2M",
+}
+ROW_RECORD_FIELDS: Tuple[str, ...] = (
+    "dataset",
+    "checkpoint_id",
+    "target_nfe",
+    "solver_name",
+    "schedule_name",
+    "row_signature",
+    "tvdp_quantization_mode",
+    "tvdp_reference_macro_steps",
+    "macro_steps",
+    "realized_nfe",
+    "score_main",
+    "latency_ms_per_sample",
+    "comparison_role",
+    "paper_method_role",
+    "experiment_scope",
+    "rollout_mode",
+    "future_block_len",
+    "row_status",
+)
+LOB_PHYSICAL_BATCH_SIZE: Mapping[str, int] = {
+    "cryptos": 8,
+    "es_mbp_10": 8,
+    SLEEP_EDF_DATASET_KEY: 2,
+}
+LOB_TRAIN_STEPS = 20_000
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description="Run OTFlow conditional-generation schedule pilots for the paper.")
+    ap.add_argument("--out_root", type=str, default="results_otflow_lob_conditional_generation_paper")
+    ap.add_argument("--datasets", type=str, default=",".join(LOB_PAPER_DATASETS))
+    ap.add_argument("--cryptos_path", type=str, default="")
+    ap.add_argument("--es_path", type=str, default="")
+    ap.add_argument("--sleep_edf_path", type=str, default=default_sleep_edf_data_path())
+    ap.add_argument("--cryptos_checkpoint_source", type=str, default="")
+    ap.add_argument("--es_checkpoint_source", type=str, default="")
+    ap.add_argument("--sleep_edf_checkpoint_source", type=str, default="")
+    ap.add_argument("--checkpoint_import_root", type=str, default="")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--dataset_seed", type=int, default=0)
+    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--steps", type=int, default=0, help="Training steps. Use dataset defaults when <= 0.")
+    ap.add_argument("--log_every", type=int, default=200)
+    ap.add_argument("--eval_horizon", type=int, default=0, help="Evaluation horizon. Use dataset default when <= 0.")
+    ap.add_argument("--eval_windows_val", type=int, default=0, help="Validation windows. Use dataset default when <= 0.")
+    ap.add_argument("--eval_windows_test", type=int, default=0, help="Test windows. Use dataset default when <= 0.")
+    ap.add_argument("--target_nfe_values", type=str, default="10,12,16")
+    ap.add_argument("--solver_names", type=str, default=",".join(MAIN_SOLVER_ORDER))
+    ap.add_argument("--schedule_names", type=str, default=",".join(MAIN_SCHEDULE_ORDER))
+    ap.add_argument("--latency_trials", type=int, default=5)
+    ap.add_argument("--latency_warmup", type=int, default=1)
+    ap.add_argument("--row_jsonl_name", type=str, default="comparison_rows.jsonl")
+    ap.add_argument("--row_csv_name", type=str, default="comparison_rows.csv")
+    ap.add_argument("--resume", action="store_true", default=True)
+    ap.add_argument("--no_resume", dest="resume", action="store_false")
+    ap.add_argument(
+        "--full_metrics",
+        dest="score_main_only",
+        action="store_false",
+        default=True,
+        help="Compute the full conditional-generation metric bundle instead of the faster score_main-only pilot path.",
+    )
+    ap.add_argument("--hidden_dim", type=int, default=160)
+    ap.add_argument("--fu_net_layers", type=int, default=3)
+    ap.add_argument("--fu_net_heads", type=int, default=4)
+    ap.add_argument("--rollout_mode", type=str, default="non_ar", choices=("non_ar", "autoregressive"))
+    ap.add_argument("--future_block_len", type=int, default=0, help="Use the locked experiment horizon when <= 0.")
+    ap.add_argument(
+        "--tvdp_reference_macro_steps",
+        type=int,
+        default=0,
+        help="Fine-grid calibration steps for TVD schedule estimation; use max(32, 4 * runtime_nfe) when <= 0.",
+    )
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-4)
+    ap.add_argument("--grad_clip", type=float, default=1.0)
+    ap.add_argument("--field_network_type", type=str, default="transformer", choices=("transformer", "resmlp", "both"))
+    ap.add_argument("--allow_execute", action="store_true", default=False)
+    return ap
+
+
+def _parse_csv(text: str) -> List[str]:
+    return [part.strip() for part in str(text).split(",") if part.strip()]
+
+
+def _parse_ints(text: str) -> List[int]:
+    return [int(part.strip()) for part in _parse_csv(text)]
+
+
+def _parse_datasets(text: str) -> List[str]:
+    datasets = _parse_csv(text)
+    unknown = [name for name in datasets if name not in CANONICAL_ALLOWED_LOB_PAPER_DATASETS]
+    if unknown:
+        raise ValueError(f"Unknown conditional-generation datasets: {unknown}")
+    return datasets
+
+
+def _parse_ordered_names(text: str, *, allowed: Sequence[str]) -> List[str]:
+    names = [str(name) for name in _parse_csv(text)]
+    allowed_names = {str(name) for name in allowed}
+    invalid = [name for name in names if name not in allowed_names]
+    if invalid:
+        raise ValueError(f"Unknown names: {invalid}. Allowed: {list(allowed_names)}")
+    deduped: List[str] = []
+    for name in names:
+        if name not in deduped:
+            deduped.append(name)
+    return deduped
+
+
+def _dataset_data_path(cli_args: argparse.Namespace, dataset: str) -> str:
+    if str(dataset) == "cryptos":
+        return str(cli_args.cryptos_path)
+    if str(dataset) == "es_mbp_10":
+        return str(cli_args.es_path)
+    if str(dataset) == SLEEP_EDF_DATASET_KEY:
+        return str(getattr(cli_args, "sleep_edf_path", ""))
+    raise ValueError(f"Unknown conditional-generation dataset: {dataset}")
+
+
+def _dataset_checkpoint_source(cli_args: argparse.Namespace, dataset: str) -> str:
+    if str(dataset) == "cryptos":
+        return str(getattr(cli_args, "cryptos_checkpoint_source", ""))
+    if str(dataset) == "es_mbp_10":
+        return str(getattr(cli_args, "es_checkpoint_source", ""))
+    if str(dataset) == SLEEP_EDF_DATASET_KEY:
+        return str(getattr(cli_args, "sleep_edf_checkpoint_source", ""))
+    raise ValueError(f"Unknown conditional-generation dataset: {dataset}")
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _resolved_checkpoint_import_root(cli_args: argparse.Namespace) -> Path:
+    raw = str(getattr(cli_args, "checkpoint_import_root", "") or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path(DEFAULT_IMPORTED_CHECKPOINT_ROOT).resolve()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _checkpoint_record_key(
+    dataset: str,
+    checkpoint_id: str,
+    target_nfe: int,
+    solver_name: str,
+    schedule_name: str,
+    row_signature: Optional[str] = None,
+) -> Tuple[str, str, int, str, str, Optional[str]]:
+    return (
+        str(dataset),
+        str(checkpoint_id),
+        int(target_nfe),
+        str(solver_name),
+        str(schedule_name),
+        None if row_signature is None else str(row_signature),
+    )
+
+
+def _load_row_records(jsonl_path: Path) -> Dict[Tuple[str, str, int, str, str, Optional[str]], Dict[str, Any]]:
+    rows: Dict[Tuple[str, str, int, str, str, Optional[str]], Dict[str, Any]] = {}
+    if not jsonl_path.exists():
+        return rows
+    with jsonl_path.open("r", encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            key = _checkpoint_record_key(
+                str(row["dataset"]),
+                str(row["checkpoint_id"]),
+                int(row["target_nfe"]),
+                str(row["solver_name"]),
+                str(row["schedule_name"]),
+                None if row.get("row_signature") is None else str(row.get("row_signature")),
+            )
+            rows[key] = dict(row)
+    return rows
+
+
+def _write_row_csv(csv_path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(ROW_RECORD_FIELDS))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field) for field in ROW_RECORD_FIELDS})
+
+
+def _append_row_record(
+    recorder: Dict[str, Any],
+    row: Mapping[str, Any],
+) -> Dict[str, Any]:
+    normalized = dict(row)
+    key = _checkpoint_record_key(
+        str(normalized["dataset"]),
+        str(normalized["checkpoint_id"]),
+        int(normalized["target_nfe"]),
+        str(normalized["solver_name"]),
+        str(normalized["schedule_name"]),
+        None if normalized.get("row_signature") is None else str(normalized.get("row_signature")),
+    )
+    if key in recorder["rows_by_key"]:
+        return dict(recorder["rows_by_key"][key])
+    recorder["jsonl_path"].parent.mkdir(parents=True, exist_ok=True)
+    with recorder["jsonl_path"].open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(normalized) + "\n")
+    recorder["rows_by_key"][key] = dict(normalized)
+    recorder["row_order"].append(key)
+    _write_row_csv(
+        recorder["csv_path"],
+        [recorder["rows_by_key"][item_key] for item_key in recorder["row_order"]],
+    )
+    return dict(normalized)
+
+
+def _init_row_recorder(out_root: Path, cli_args: argparse.Namespace) -> Dict[str, Any]:
+    jsonl_path = out_root / str(getattr(cli_args, "row_jsonl_name"))
+    csv_path = out_root / str(getattr(cli_args, "row_csv_name"))
+    rows_by_key = _load_row_records(jsonl_path)
+    row_order = list(rows_by_key.keys())
+    _write_row_csv(csv_path, [rows_by_key[item_key] for item_key in row_order])
+    return {
+        "jsonl_path": jsonl_path,
+        "csv_path": csv_path,
+        "rows_by_key": rows_by_key,
+        "row_order": row_order,
+    }
+
+
+def _resolved_train_steps(cli_args: argparse.Namespace, dataset: str) -> int:
+    del dataset
+    return int(cli_args.steps) if int(cli_args.steps) > 0 else int(LOB_TRAIN_STEPS)
+
+
+def _resolved_eval_horizon(cli_args: argparse.Namespace, dataset: str) -> int:
+    spec = experiment_plan_by_key()[str(dataset)]
+    return int(cli_args.eval_horizon) if int(cli_args.eval_horizon) > 0 else int(spec.experiment_horizon)
+
+
+def _resolved_eval_windows(cli_args: argparse.Namespace, dataset: str, split: str) -> int:
+    from benchmark_otflow_suite import DATASET_PLANS
+
+    assert split in {"val", "test"}
+    raw = int(cli_args.eval_windows_val if split == "val" else cli_args.eval_windows_test)
+    if raw > 0:
+        return raw
+    plan = DATASET_PLANS[str(dataset)]
+    return int(plan.eval_windows_final)
+
+
+def _make_dataset_args_from_cfg(
+    cli_args: argparse.Namespace,
+    dataset: str,
+    field_network_type: str,
+    cfg,
+) -> argparse.Namespace:
+    args = _make_dataset_args(cli_args, dataset, field_network_type)
+    args.levels = int(cfg.levels)
+    args.token_dim = int(getattr(cfg, "token_dim", getattr(args, "token_dim", 4 * int(cfg.levels))))
+    args.history_len = int(cfg.history_len)
+    args.batch_size = int(cfg.batch_size)
+    args.use_cond_features = bool(getattr(cfg, "use_cond_features", getattr(args, "use_cond_features", False)))
+    args.cond_standardize = bool(getattr(cfg, "cond_standardize", getattr(args, "cond_standardize", True)))
+    args.hidden_dim = int(cfg.hidden_dim)
+    args.ctx_encoder = str(getattr(cfg.model, "ctx_encoder", args.ctx_encoder))
+    args.ctx_causal = bool(getattr(cfg.model, "ctx_causal", args.ctx_causal))
+    args.ctx_local_kernel = int(getattr(cfg.model, "ctx_local_kernel", args.ctx_local_kernel))
+    args.use_time_features = bool(getattr(cfg.model, "use_time_features", getattr(args, "use_time_features", False)))
+    args.use_time_gaps = bool(getattr(cfg.model, "use_time_gaps", getattr(args, "use_time_gaps", False)))
+    args.fu_net_type = str(getattr(cfg.model, "fu_net_type", field_network_type))
+    args.fu_net_layers = int(getattr(cfg.model, "fu_net_layers", args.fu_net_layers))
+    args.fu_net_heads = int(getattr(cfg.model, "fu_net_heads", args.fu_net_heads))
+    args.rollout_mode = str(getattr(cfg.model, "rollout_mode", args.rollout_mode))
+    args.future_block_len = int(getattr(cfg.model, "future_block_len", args.future_block_len))
+    return args
+
+
+def _make_dataset_args(cli_args: argparse.Namespace, dataset: str, field_network_type: str) -> argparse.Namespace:
+    from benchmark_otflow_suite import DATASET_PLANS
+
+    plan = DATASET_PLANS[str(dataset)]
+    experiment_spec = experiment_plan_by_key()[str(dataset)]
+    preset = get_otflow_paper_backbone_preset(str(dataset))
+    batch_size = int(LOB_PHYSICAL_BATCH_SIZE[str(dataset)])
+    grad_accum_steps = max(1, int(math.ceil(32.0 / float(max(1, batch_size)))))
+    locked_future_block_len = (
+        int(cli_args.future_block_len)
+        if int(getattr(cli_args, "future_block_len", 0)) > 0
+        else int(experiment_spec.future_block_len)
+    )
+    return argparse.Namespace(
+        dataset=str(dataset),
+        data_path=_dataset_data_path(cli_args, str(dataset)),
+        synthetic_length=int(plan.synthetic_length),
+        seed=int(cli_args.dataset_seed),
+        device=str(cli_args.device),
+        train_frac=plan.train_frac,
+        val_frac=plan.val_frac,
+        test_frac=plan.test_frac,
+        stride_train=plan.stride_train,
+        stride_eval=plan.stride_eval,
+        levels=int(preset["levels"]),
+        token_dim=int(preset.get("token_dim", 4 * int(preset["levels"]))),
+        history_len=int(experiment_spec.history_len),
+        batch_size=int(batch_size),
+        lr=float(cli_args.lr),
+        weight_decay=float(cli_args.weight_decay),
+        grad_clip=float(cli_args.grad_clip),
+        standardize=True,
+        use_cond_features=bool(preset.get("use_cond_features", False)),
+        cond_standardize=bool(preset.get("cond_standardize", True)),
+        hidden_dim=int(cli_args.hidden_dim),
+        ctx_encoder=str(preset["ctx_encoder"]),
+        ctx_causal=bool(preset["ctx_causal"]),
+        ctx_local_kernel=int(preset["ctx_local_kernel"]),
+        ctx_pool_scales=str(preset["ctx_pool_scales"]),
+        use_time_features=bool(preset.get("use_time_features", preset.get("use_time_gaps", False))),
+        use_time_gaps=bool(preset.get("use_time_gaps", False)),
+        field_parameterization="instantaneous",
+        fu_net_type=str(field_network_type),
+        fu_net_layers=int(cli_args.fu_net_layers),
+        fu_net_heads=int(cli_args.fu_net_heads),
+        rollout_mode=str(cli_args.rollout_mode),
+        future_block_len=int(locked_future_block_len),
+        adaptive_context=False,
+        adaptive_context_ratio=None,
+        adaptive_context_min=None,
+        adaptive_context_max=None,
+        train_variable_context=False,
+        train_context_min=None,
+        train_context_max=None,
+        lambda_consistency=0.0,
+        lambda_imbalance=0.0,
+        lambda_causal_ot=0.0,
+        lambda_current_match=0.0,
+        lambda_path_fm=0.0,
+        lambda_mi=0.0,
+        lambda_mi_critic=0.0,
+        use_minibatch_ot=True,
+        solver="euler",
+        use_amp=True,
+        grad_accum_steps=int(grad_accum_steps),
+    )
+
+
+def _sample_overrides_latency(
+    model: torch.nn.Module,
+    cfg,
+    ds,
+    *,
+    horizon: int,
+    runtime_nfe: int,
+    solver_name: str,
+    time_grid: Sequence[float],
+    seed: int,
+    n_trials: int,
+    warmup: int,
+) -> Dict[str, float]:
+    time_grid_override = tuple(float(x) for x in time_grid)
+    backup = _apply_sample_overrides(model, cfg, solver=str(solver_name), time_grid=time_grid_override)
+    try:
+        return benchmark_sampling_latency(
+            ds,
+            model,
+            cfg,
+            horizon=int(horizon),
+            nfe=int(runtime_nfe),
+            n_trials=int(n_trials),
+            warmup=int(warmup),
+            seed=int(seed),
+        )
+    finally:
+        _restore_sample_overrides(model, cfg, backup)
+
+
+def _load_checkpoint_model(ckpt_path: Path, device: torch.device) -> Tuple[OTFlow, Any]:
+    from config import LOBConfig
+
+    ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    cfg_dict = ckpt["cfg"]
+    cfg = LOBConfig()
+    section_types = {
+        "data": type(cfg.data),
+        "model": type(cfg.model),
+        "fm": type(cfg.fm),
+        "nf": type(cfg.nf),
+        "train": type(cfg.train),
+        "sample": type(cfg.sample),
+    }
+    for section_name, cls in section_types.items():
+        section_values = dict(cfg_dict[section_name])
+        if section_name == "train":
+            section_values["device"] = device
+        setattr(cfg, section_name, cls(**section_values))
+    cfg.train.device = device
+
+    model = OTFlow(cfg).to(device)
+    model.load_state_dict(ckpt["model_state"])
+    if ckpt.get("params_mean") is not None and ckpt.get("params_std") is not None:
+        model.set_param_normalizer(ckpt["params_mean"], ckpt["params_std"])
+    model.eval()
+    return model, cfg
+
+
+def _prepare_imported_checkpoint(
+    *,
+    cli_args: argparse.Namespace,
+    dataset: str,
+    field_network_type: str,
+) -> Optional[Dict[str, Any]]:
+    source_text = _dataset_checkpoint_source(cli_args, dataset).strip()
+    if not source_text:
+        return None
+
+    source_path = Path(source_text).expanduser().resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(f"Checkpoint source does not exist: {source_path}")
+
+    source_sha256 = _sha256_file(source_path)
+    import_root = _resolved_checkpoint_import_root(cli_args)
+    import_dir = import_root / str(dataset) / str(field_network_type)
+    import_dir.mkdir(parents=True, exist_ok=True)
+    imported_path = import_dir / "model.pt"
+    if (not imported_path.exists()) or _sha256_file(imported_path) != source_sha256:
+        shutil.copy2(str(source_path), str(imported_path))
+
+    ckpt = torch.load(str(imported_path), map_location="cpu", weights_only=False)
+    cfg_dict = dict(ckpt["cfg"])
+    model_cfg = dict(cfg_dict.get("model", {}))
+    checkpoint_id = (
+        f"{str(dataset)}_{str(field_network_type)}_"
+        f"{str(model_cfg.get('rollout_mode', 'autoregressive'))}_"
+        f"b{int(model_cfg.get('future_block_len', 1))}_"
+        f"{source_sha256[:8]}"
+    )
+    provenance = {
+        "checkpoint_id": checkpoint_id,
+        "dataset": str(dataset),
+        "backbone_name": "otflow",
+        "field_network_type": str(model_cfg.get("fu_net_type", field_network_type)),
+        "rollout_mode": str(model_cfg.get("rollout_mode", "autoregressive")),
+        "future_block_len": int(model_cfg.get("future_block_len", 1)),
+        "original_source_path": str(source_path),
+        "source_sha256": source_sha256,
+        "imported_checkpoint_path": str(imported_path),
+    }
+    metadata_path = import_dir / "checkpoint_provenance.json"
+    metadata_path.write_text(json.dumps(provenance, indent=2), encoding="utf-8")
+    return provenance
+
+
+def _train_or_resume(
+    cli_args: argparse.Namespace,
+    dataset: str,
+    field_network_type: str,
+    out_dir: Path,
+    checkpoint_path: Optional[Path] = None,
+):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    imported_ckpt_path = None if checkpoint_path is None else Path(checkpoint_path).expanduser().resolve()
+    if imported_ckpt_path is not None:
+        model, cfg = _load_checkpoint_model(imported_ckpt_path, device=torch.device(cli_args.device))
+        dataset_args = _make_dataset_args_from_cfg(cli_args, dataset, field_network_type, cfg)
+        splits = build_dataset_splits(dataset_args, cfg)
+        return model, cfg, splits, imported_ckpt_path
+
+    dataset_args = _make_dataset_args(cli_args, dataset, field_network_type)
+    cfg = build_cfg_from_args(dataset_args)
+    splits = build_dataset_splits(dataset_args, cfg)
+    ckpt_path = out_dir / "model.pt"
+    if bool(cli_args.resume) and ckpt_path.exists():
+        model, cfg = _load_checkpoint_model(ckpt_path, device=torch.device(cli_args.device))
+        return model, cfg, splits, ckpt_path
+
+    seed_all(int(cli_args.seed))
+    model = train_loop(
+        splits["train"],
+        cfg,
+        model_name="otflow",
+        steps=int(_resolved_train_steps(cli_args, dataset)),
+        log_every=int(cli_args.log_every),
+    )
+    _save_checkpoint(str(ckpt_path), model, cfg, splits["train"])
+    return model, cfg, splits, ckpt_path
+
+
+def _pilot_row_labels(target_nfe: int) -> Dict[str, str]:
+    return {
+        "uniform_euler_n_minus_1": f"Time-uniform (N-1={int(target_nfe) - 1})",
+        "uniform_euler_n": f"Time-uniform (N={int(target_nfe)})",
+        "uniform_euler_n_plus_1": f"Time-uniform (N+1={int(target_nfe) + 1})",
+        "late_power_2": "Late-power-2",
+        "late_power_3": "Late-power-3",
+        "early_biased_control": "Early-biased control",
+        "ays": "AYS",
+        "gits": "GITS",
+        "ots": "OTS",
+        TVDP_SCHEDULE_KEY: "TVD-p schedule",
+        "heun": "Heun / RK2",
+        "midpoint_rk2": "Midpoint RK2",
+        "dopri5": "Dopri5 / Dormand-Prince",
+        "rk45": "RK45 / Runge-Kutta45",
+        "dpmpp2m": "DPM++2M",
+    }
+
+
+def _solver_eval_multiplier(solver_key: str) -> int:
+    key = str(solver_key)
+    if key in {"euler", "dpmpp2m"}:
+        return 1
+    if key in {"heun", "midpoint_rk2"}:
+        return 2
+    if key in {"dopri5", "rk45"}:
+        return 6
+    raise ValueError(f"Unsupported solver_key={solver_key}")
+
+
+def _solver_macro_steps(solver_key: str, target_nfe: int) -> int:
+    if str(solver_key) in {"heun", "midpoint_rk2"}:
+        if int(target_nfe) % 2 != 0:
+            raise ValueError(f"{solver_key} requires an even target_nfe, got {target_nfe}")
+        return int(target_nfe) // 2
+    multiplier = int(_solver_eval_multiplier(str(solver_key)))
+    if multiplier == 1:
+        return int(target_nfe)
+    return max(1, int(round(float(target_nfe) / float(multiplier))))
+
+
+def _solver_exact_nfe_peer(solver_key: str, target_nfe: int) -> bool:
+    macro_steps = _solver_macro_steps(str(solver_key), int(target_nfe))
+    realized = int(macro_steps) * int(_solver_eval_multiplier(str(solver_key)))
+    return realized == int(target_nfe)
+
+
+def _solver_experiment_scope(solver_key: str) -> str:
+    return "solver_transfer" if str(solver_key) in TRANSFER_SOLVER_ORDER else "main"
+
+
+def _solver_order_p(solver_key: str) -> float:
+    key = str(solver_key)
+    if key == "euler":
+        return 1.0
+    if key in {"heun", "midpoint_rk2", "dpmpp2m"}:
+        return 2.0
+    if key in {"dopri5", "rk45"}:
+        return 5.0
+    raise ValueError(f"Unsupported solver for TVD-p order mapping: {solver_key}")
+
+
+def _resolved_tvdp_reference_macro_steps(requested_macro_steps: int, runtime_nfe: int) -> int:
+    requested = int(requested_macro_steps)
+    if requested > 0:
+        return requested
+    return max(32, 4 * int(runtime_nfe))
+
+
+def _tvdp_row_signature(
+    *,
+    signal_trace_key: str,
+    signal_family_name: str,
+    quantization_mode: str,
+    reference_macro_steps: int,
+) -> str:
+    return (
+        f"{_TVDP_ROW_SIGNATURE_VERSION}:"
+        f"{str(signal_family_name).strip()}:"
+        f"{str(signal_trace_key).strip()}:"
+        f"{str(quantization_mode).strip()}:"
+        f"{int(reference_macro_steps)}"
+    )
+
+
+def _schedule_experiment_scope(solver_key: str, schedule_name: str) -> str:
+    solver_scope = _solver_experiment_scope(str(solver_key))
+    if solver_scope == "solver_transfer":
+        return "solver_transfer"
+    return "main"
+
+
+def _schedule_allowed_for_solver(solver_key: str, schedule_name: str) -> bool:
+    if str(schedule_name) in EULER_ONLY_MAIN_MATRIX_SCHEDULES and str(solver_key) != "euler":
+        return False
+    return True
+
+
+def _schedule_comparison_role(solver_key: str, schedule_name: str, base_role: str) -> str:
+    scope = _schedule_experiment_scope(str(solver_key), str(schedule_name))
+    if scope == "solver_transfer":
+        return "solver_transfer_case"
+    if str(schedule_name) == TVDP_SCHEDULE_KEY:
+        return "paper_method"
+    return str(base_role)
+
+
+def _grid_kind_for_schedule(schedule_name: str) -> str:
+    schedule_name = str(schedule_name)
+    if str(schedule_name) == "uniform":
+        return "uniform_schedule"
+    if str(schedule_name) == TVDP_SCHEDULE_KEY:
+        return "signal_schedule"
+    if str(schedule_name) in {"ays", "gits", "ots"}:
+        return "published_fixed_schedule"
+    return "generic_fixed_schedule"
+
+
+def _paper_method_role_for_schedule(schedule_name: str) -> str:
+    if str(schedule_name) == TVDP_SCHEDULE_KEY:
+        return "method"
+    return "baseline"
+
+
+def _schedule_paper_method_role(solver_key: str, schedule_name: str) -> str:
+    scope = _schedule_experiment_scope(str(solver_key), str(schedule_name))
+    if scope == "solver_transfer":
+        return "solver_transfer"
+    return _paper_method_role_for_schedule(str(schedule_name))
+
+
+def _build_schedule_time_grid(
+    *,
+    solver_key: str,
+    schedule_name: str,
+    macro_steps: int,
+    calibration: Optional[Mapping[str, Any]],
+) -> Tuple[Tuple[float, ...], Dict[str, Any]]:
+    schedule_name = str(schedule_name)
+    if str(schedule_name) == "uniform":
+        grid = build_schedule_grid("uniform", int(macro_steps))
+        if grid is None:
+            raise ValueError(f"Unable to build grid for schedule={schedule_name}")
+        return tuple(float(x) for x in grid), {}
+    if str(schedule_name) == TVDP_SCHEDULE_KEY:
+        if calibration is None:
+            raise ValueError("tvdp_schedule requires solver-specific calibration")
+        details = tvdp_schedule_details(
+            calibration,
+            macro_steps=int(macro_steps),
+            delta=float(_TVDP_DELTA),
+            solver_order=float(_solver_order_p(str(solver_key))),
+            signal_trace_key=str(_TVDP_SIGNAL_TRACE_KEY),
+        )
+        return (
+            tuple(float(x) for x in details["time_grid"]),
+            {
+                "signal_trace_key": str(_TVDP_SIGNAL_TRACE_KEY),
+                "tvdp_delta": float(_TVDP_DELTA),
+                "tvdp_solver_order": float(_solver_order_p(str(solver_key))),
+                "tvdp_signal_normalized": True,
+                "tvdp_quantization_mode": str(details["quantization_mode"]),
+                "tvdp_reference_macro_steps": int(details["reference_macro_steps"]),
+                "tvdp_reference_time_grid": [float(x) for x in details["reference_time_grid"]],
+                "tvdp_reference_time_alignment": str(details["reference_time_alignment"]),
+                "tvdp_paper_indices": [int(x) for x in details["paper_indices"]],
+                "tvdp_paper_time_grid": [float(x) for x in details["paper_time_grid"]],
+                "tvdp_paper_duplicate_count": int(details["paper_duplicate_count"]),
+                "paper_discrete_reference": dict(details["paper_discrete_reference"]),
+                "row_signature": _tvdp_row_signature(
+                    signal_trace_key=str(_TVDP_SIGNAL_TRACE_KEY),
+                    signal_family_name=str(_TVDP_SIGNAL_FAMILY_NAME),
+                    quantization_mode=str(details["quantization_mode"]),
+                    reference_macro_steps=int(details["reference_macro_steps"]),
+                ),
+            },
+        )
+    grid = build_schedule_grid(str(schedule_name), int(macro_steps))
+    if grid is None:
+        raise ValueError(f"Unable to build grid for schedule={schedule_name}")
+    return tuple(float(x) for x in grid), {}
+
+
+def _matrix_spec(
+    *,
+    dataset: str,
+    field_network_type: str,
+    checkpoint_id: str,
+    solver_key: str,
+    schedule_name: str,
+    target_nfe: int,
+    calibration: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    canonical_name = str(schedule_name)
+    macro_steps = _solver_macro_steps(str(solver_key), int(target_nfe))
+    time_grid, tvdp_metadata = _build_schedule_time_grid(
+        solver_key=str(solver_key),
+        schedule_name=str(canonical_name),
+        macro_steps=int(macro_steps),
+        calibration=calibration,
+    )
+    signal_family_name = None
+    signal_validation = None
+    smooth_window = None
+    temper_alpha = None
+    uniform_floor = None
+    if str(canonical_name) == TVDP_SCHEDULE_KEY:
+        signal_family_name = _TVDP_SIGNAL_FAMILY_NAME
+        signal_validation = signal_validation_spearman(calibration, str(_TVDP_SIGNAL_TRACE_KEY)) if calibration is not None else None
+        uniform_floor = float(_TVDP_DELTA)
+    spec = _make_base_spec(
+        dataset=str(dataset),
+        field_network_type=str(field_network_type),
+        solver_name=str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
+        schedule_name=str(canonical_name),
+        schedule_display_name=str(SCHEDULE_DISPLAY_NAMES[str(canonical_name)]),
+        target_nfe=int(target_nfe),
+        runtime_nfe=int(macro_steps),
+        time_grid=time_grid,
+        comparison_role=_schedule_comparison_role(str(solver_key), str(canonical_name), "schedule_matrix"),
+        paper_method_role=_schedule_paper_method_role(str(solver_key), str(canonical_name)),
+        exact_nfe_peer=_solver_exact_nfe_peer(str(solver_key), int(target_nfe)),
+        row_group=str(SOLVER_DISPLAY_NAMES[str(solver_key)]),
+        grid_kind=_grid_kind_for_schedule(str(canonical_name)),
+        selection_group="schedule_matrix",
+        signal_family_name=signal_family_name,
+        signal_validation_spearman=signal_validation,
+        smooth_window=smooth_window,
+        temper_alpha=temper_alpha,
+        uniform_floor=uniform_floor,
+    )
+    spec.update(
+        {
+            "checkpoint_id": str(checkpoint_id),
+            "solver_key": str(solver_key),
+            "macro_steps": int(macro_steps),
+            "experiment_scope": _schedule_experiment_scope(str(solver_key), str(schedule_name)),
+        }
+    )
+    spec.update(tvdp_metadata)
+    return spec
+
+
+def _build_schedule_matrix_specs(
+    *,
+    dataset: str,
+    field_network_type: str,
+    checkpoint_id: str,
+    target_nfe: int,
+    solver_names: Sequence[str],
+    schedule_names: Sequence[str],
+    calibrations: Mapping[str, Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    specs: List[Dict[str, Any]] = []
+    for solver_key in solver_names:
+        calibration = calibrations.get(str(solver_key))
+        for schedule_name in schedule_names:
+            if not _schedule_allowed_for_solver(str(solver_key), str(schedule_name)):
+                continue
+            schedule_calibration = calibration if str(schedule_name) == TVDP_SCHEDULE_KEY else None
+            specs.append(
+                _matrix_spec(
+                    dataset=str(dataset),
+                    field_network_type=str(field_network_type),
+                    checkpoint_id=str(checkpoint_id),
+                    solver_key=str(solver_key),
+                    schedule_name=str(schedule_name),
+                    target_nfe=int(target_nfe),
+                    calibration=schedule_calibration,
+                )
+            )
+    return specs
+
+
+def _make_base_spec(
+    *,
+    dataset: str,
+    field_network_type: str,
+    solver_name: str,
+    schedule_name: str,
+    schedule_display_name: str,
+    target_nfe: int,
+    runtime_nfe: int,
+    time_grid: Sequence[float],
+    comparison_role: str,
+    paper_method_role: str,
+    exact_nfe_peer: bool,
+    row_group: str,
+    grid_kind: str,
+    selection_group: str,
+    signal_family_name: Optional[str] = None,
+    signal_validation_spearman: Optional[float] = None,
+    smooth_window: Optional[int] = None,
+    temper_alpha: Optional[float] = None,
+    uniform_floor: Optional[float] = None,
+    experiment_scope: str = "main",
+) -> Dict[str, Any]:
+    return {
+        "dataset": str(dataset),
+        "field_network_type": str(field_network_type),
+        "solver_name": str(solver_name),
+        "schedule_name": str(schedule_name),
+        "schedule_display_name": str(schedule_display_name),
+        "target_nfe": int(target_nfe),
+        "runtime_nfe": int(runtime_nfe),
+        "nfe": int(runtime_nfe),
+        "time_grid": [float(x) for x in time_grid],
+        "comparison_role": str(comparison_role),
+        "paper_method_role": str(paper_method_role),
+        "exact_nfe_peer": bool(exact_nfe_peer),
+        "row_group": str(row_group),
+        "grid_name": str(schedule_name),
+        "grid_kind": str(grid_kind),
+        "selection_group": str(selection_group),
+        "experiment_scope": str(experiment_scope),
+        "power": None,
+        "piecewise_early_frac": None,
+        "offline_smooth_window": None if smooth_window is None else int(smooth_window),
+        "offline_signal_source": None if signal_family_name is None else str(signal_family_name),
+        "signal_family_name": None if signal_family_name is None else str(signal_family_name),
+        "row_signature": None,
+        "signal_validation_spearman": None
+        if signal_validation_spearman is None
+        else float(signal_validation_spearman),
+        "temper_alpha": None if temper_alpha is None else float(temper_alpha),
+        "uniform_floor": None if uniform_floor is None else float(uniform_floor),
+    }
+
+def _run_spec(
+    *,
+    model: torch.nn.Module,
+    ds,
+    cfg,
+    eval_horizon: int,
+    eval_windows: int,
+    chosen_t0s: Sequence[int],
+    generation_seed_base: int,
+    metrics_seed: int,
+    score_main_only: bool,
+    latency_trials: int,
+    latency_warmup: int,
+    latency_seed: int,
+    spec: Mapping[str, Any],
+) -> Dict[str, Any]:
+    row = run_fixed_schedule_variant(
+        model=model,
+        ds=ds,
+        cfg=cfg,
+        eval_horizon=int(eval_horizon),
+        eval_windows=int(eval_windows),
+        grid_spec=spec,
+        chosen_t0s=chosen_t0s,
+        generation_seed_base=int(generation_seed_base),
+        metrics_seed=int(metrics_seed),
+        score_main_only=bool(score_main_only),
+    )
+    latency = _sample_overrides_latency(
+        model,
+        cfg,
+        ds,
+        horizon=int(eval_horizon),
+        runtime_nfe=int(spec["runtime_nfe"]),
+        solver_name=str(spec["solver_name"]),
+        time_grid=spec["time_grid"],
+        seed=int(latency_seed),
+        n_trials=int(latency_trials),
+        warmup=int(latency_warmup),
+    )
+    latency_ms_per_sample = float(
+        latency.get("latency_ms_per_sample", latency.get("latency_ms_per_sample_mean", float("nan")))
+    )
+    latency_ms_per_step = float(
+        latency.get("latency_ms_per_step", latency.get("latency_ms_per_step_mean", float("nan")))
+    )
+    throughput_steps_per_s = float(
+        latency.get("throughput_steps_per_s", latency.get("throughput_steps_per_s_mean", float("nan")))
+    )
+    row.update(
+        {
+            "dataset": str(spec["dataset"]),
+            "checkpoint_id": str(spec["checkpoint_id"]),
+            "backbone_name": "otflow",
+            "field_network_type": str(spec["field_network_type"]),
+            "rollout_mode": str(getattr(cfg, "rollout_mode", "autoregressive")),
+            "future_block_len": int(getattr(cfg, "prediction_horizon", 1)),
+            "solver_key": str(spec["solver_key"]),
+            "schedule_name": str(spec["schedule_name"]),
+            "schedule_display_name": str(spec["schedule_display_name"]),
+            "target_nfe": int(spec["target_nfe"]),
+            "runtime_nfe": int(spec["runtime_nfe"]),
+            "macro_steps": int(spec["macro_steps"]),
+            "row_signature": None if spec.get("row_signature") is None else str(spec.get("row_signature")),
+            "realized_nfe": float(row["mean_total_field_evals_per_rollout"]),
+            "exact_nfe_peer": bool(spec["exact_nfe_peer"]),
+            "comparison_role": str(spec["comparison_role"]),
+            "paper_method_role": str(spec["paper_method_role"]),
+            "experiment_scope": str(spec.get("experiment_scope", "main")),
+            "row_group": str(spec["row_group"]),
+            "latency_ms_per_sample": latency_ms_per_sample,
+            "latency_ms_per_step": latency_ms_per_step,
+            "throughput_steps_per_s": throughput_steps_per_s,
+            "latency_trials": int(latency.get("n_trials", 0)),
+            "row_status": "completed",
+        }
+    )
+    optional_spec_fields = {
+        "signal_trace_key": None if spec.get("signal_trace_key") is None else str(spec.get("signal_trace_key")),
+        "tvdp_delta": None if spec.get("tvdp_delta") is None else float(spec.get("tvdp_delta")),
+        "tvdp_solver_order": None if spec.get("tvdp_solver_order") is None else float(spec.get("tvdp_solver_order")),
+        "tvdp_signal_normalized": None
+        if spec.get("tvdp_signal_normalized") is None
+        else bool(spec.get("tvdp_signal_normalized")),
+        "tvdp_quantization_mode": None
+        if spec.get("tvdp_quantization_mode") is None
+        else str(spec.get("tvdp_quantization_mode")),
+        "tvdp_reference_macro_steps": None
+        if spec.get("tvdp_reference_macro_steps") is None
+        else int(spec.get("tvdp_reference_macro_steps")),
+        "tvdp_reference_time_grid": None
+        if spec.get("tvdp_reference_time_grid") is None
+        else [float(x) for x in spec.get("tvdp_reference_time_grid", [])],
+        "tvdp_reference_time_alignment": None
+        if spec.get("tvdp_reference_time_alignment") is None
+        else str(spec.get("tvdp_reference_time_alignment")),
+        "tvdp_paper_indices": None
+        if spec.get("tvdp_paper_indices") is None
+        else [int(x) for x in spec.get("tvdp_paper_indices", [])],
+        "tvdp_paper_time_grid": None
+        if spec.get("tvdp_paper_time_grid") is None
+        else [float(x) for x in spec.get("tvdp_paper_time_grid", [])],
+        "tvdp_paper_duplicate_count": None
+        if spec.get("tvdp_paper_duplicate_count") is None
+        else int(spec.get("tvdp_paper_duplicate_count")),
+        "paper_discrete_reference": None
+        if spec.get("paper_discrete_reference") is None
+        else {
+            "quantization_mode": str(spec["paper_discrete_reference"]["quantization_mode"]),
+            "indices": [int(x) for x in spec["paper_discrete_reference"]["indices"]],
+            "time_grid": [float(x) for x in spec["paper_discrete_reference"]["time_grid"]],
+            "duplicate_count": int(spec["paper_discrete_reference"]["duplicate_count"]),
+        },
+    }
+    row.update({key: value for key, value in optional_spec_fields.items() if value is not None})
+    return row
+
+
+def _execute_dataset_matrix(
+    cli_args: argparse.Namespace,
+    *,
+    dataset: str,
+    field_network_type: str,
+    target_nfe_values: Sequence[int],
+    out_dir: Path,
+    solver_names: Sequence[str],
+    schedule_names: Sequence[str],
+    row_recorder: Dict[str, Any],
+    checkpoint_info: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    imported_checkpoint_path = None
+    checkpoint_id = f"{str(dataset)}_{str(field_network_type)}_local"
+    if checkpoint_info is not None:
+        imported_checkpoint_path = Path(str(checkpoint_info["imported_checkpoint_path"]))
+        checkpoint_id = str(checkpoint_info["checkpoint_id"])
+
+    model, cfg, splits, ckpt_path = _train_or_resume(
+        cli_args,
+        dataset,
+        field_network_type,
+        out_dir,
+        checkpoint_path=imported_checkpoint_path,
+    )
+    ds_val = splits["val"]
+    ds_test = splits["test"]
+
+    eval_horizon = int(_resolved_eval_horizon(cli_args, dataset))
+    val_windows = int(_resolved_eval_windows(cli_args, dataset, "val"))
+    test_windows = int(_resolved_eval_windows(cli_args, dataset, "test"))
+    val_window_seed = int(cli_args.seed) + 17
+    test_window_seed = int(cli_args.seed) + 101
+    val_generation_seed_base = int(cli_args.seed) + 1001
+    test_generation_seed_base = int(cli_args.seed) + 2001
+    val_metrics_seed = int(cli_args.seed) + 3001
+    test_metrics_seed = int(cli_args.seed) + 4001
+    latency_seed = int(cli_args.seed) + 5001
+
+    chosen_val_t0s = _choose_valid_windows(ds_val, horizon=eval_horizon, n_windows=val_windows, seed=val_window_seed)
+    chosen_test_t0s = _choose_valid_windows(ds_test, horizon=eval_horizon, n_windows=test_windows, seed=test_window_seed)
+
+    dataset_rows: List[Dict[str, Any]] = []
+    selection_details: List[Dict[str, Any]] = []
+    requested_tvdp_reference_macro_steps = int(getattr(cli_args, "tvdp_reference_macro_steps", 0))
+    requires_tvdp_calibration = TVDP_SCHEDULE_KEY in {str(name) for name in schedule_names}
+
+    for target_nfe in target_nfe_values:
+        solver_calibrations: Dict[str, Dict[str, Any]] = {}
+        if requires_tvdp_calibration:
+            for solver_key in solver_names:
+                runtime_nfe = _solver_macro_steps(str(solver_key), int(target_nfe))
+                solver_calibrations[str(solver_key)] = _collect_calibration(
+                    model,
+                    ds_val,
+                    cfg,
+                    horizon=int(eval_horizon),
+                    macro_steps=_resolved_tvdp_reference_macro_steps(
+                        int(requested_tvdp_reference_macro_steps),
+                        int(runtime_nfe),
+                    ),
+                    n_windows=int(val_windows),
+                    seed=int(val_window_seed),
+                    sigma_eps=1e-6,
+                    solver=str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
+                    chosen_t0s=[int(t0) for t0 in chosen_val_t0s.tolist()],
+                    generation_seed_base=int(val_generation_seed_base),
+                )
+
+        candidate_specs = _build_schedule_matrix_specs(
+            dataset=str(dataset),
+            field_network_type=str(field_network_type),
+            checkpoint_id=str(checkpoint_id),
+            target_nfe=int(target_nfe),
+            solver_names=solver_names,
+            schedule_names=schedule_names,
+            calibrations=solver_calibrations,
+        )
+        tvdp_specs_by_solver = {
+            str(spec["solver_key"]): spec for spec in candidate_specs if str(spec["schedule_name"]) == TVDP_SCHEDULE_KEY
+        }
+
+        for spec_idx, spec in enumerate(candidate_specs):
+            record_key = _checkpoint_record_key(
+                str(dataset),
+                str(checkpoint_id),
+                int(target_nfe),
+                str(spec["solver_name"]),
+                str(spec["schedule_name"]),
+                None if spec.get("row_signature") is None else str(spec.get("row_signature")),
+            )
+            existing_row = row_recorder["rows_by_key"].get(record_key)
+            if existing_row is not None:
+                dataset_rows.append(dict(existing_row))
+                continue
+
+            test_row = _run_spec(
+                model=model,
+                ds=ds_test,
+                cfg=cfg,
+                eval_horizon=int(eval_horizon),
+                eval_windows=int(test_windows),
+                chosen_t0s=[int(t0) for t0 in chosen_test_t0s.tolist()],
+                generation_seed_base=int(test_generation_seed_base),
+                metrics_seed=int(test_metrics_seed),
+                score_main_only=bool(cli_args.score_main_only),
+                latency_trials=int(cli_args.latency_trials),
+                latency_warmup=int(cli_args.latency_warmup),
+                latency_seed=int(latency_seed + spec_idx + 1000 * int(target_nfe)),
+                spec=spec,
+            )
+            stored_row = _append_row_record(row_recorder, test_row)
+            dataset_rows.append(dict(stored_row))
+
+        selection_details.append(
+            {
+                "target_nfe": int(target_nfe),
+                "chosen_val_t0s": [int(t0) for t0 in chosen_val_t0s.tolist()],
+                "chosen_test_t0s": [int(t0) for t0 in chosen_test_t0s.tolist()],
+                "solver_calibration": {
+                    str(solver_key): {
+                        "solver_name": str(SOLVER_RUNTIME_NAMES[str(solver_key)]),
+                        "macro_steps": int(_solver_macro_steps(str(solver_key), int(target_nfe))),
+                        "signal_correlations_vs_oracle": solver_calibrations[str(solver_key)].get(
+                            "signal_correlations_vs_oracle",
+                            {},
+                        )
+                        if str(solver_key) in solver_calibrations
+                        else {},
+                        "tvdp_params": None
+                        if str(solver_key) not in tvdp_specs_by_solver
+                        else {
+                            "signal_trace_key": str(_TVDP_SIGNAL_TRACE_KEY),
+                            "signal_family_name": str(_TVDP_SIGNAL_FAMILY_NAME),
+                            "delta": float(_TVDP_DELTA),
+                            "solver_order_p": float(_solver_order_p(str(solver_key))),
+                            "quantization_mode": str(tvdp_specs_by_solver[str(solver_key)]["tvdp_quantization_mode"]),
+                        },
+                        "tvdp_reference_macro_steps": None
+                        if str(solver_key) not in solver_calibrations
+                        else int(solver_calibrations[str(solver_key)]["macro_steps"]),
+                        "tvdp_reference_time_grid": None
+                        if str(solver_key) not in solver_calibrations
+                        else [float(x) for x in solver_calibrations[str(solver_key)]["reference_time_grid"]],
+                        "paper_discrete_reference": None
+                        if str(solver_key) not in tvdp_specs_by_solver
+                        else {
+                            "variants": [
+                                {
+                                    "schedule_name": str(TVDP_SCHEDULE_KEY),
+                                    "quantization_mode": str(tvdp_specs_by_solver[str(solver_key)]["tvdp_quantization_mode"]),
+                                    "indices": [int(x) for x in tvdp_specs_by_solver[str(solver_key)]["tvdp_paper_indices"]],
+                                    "time_grid": [
+                                        float(x) for x in tvdp_specs_by_solver[str(solver_key)]["tvdp_paper_time_grid"]
+                                    ],
+                                    "duplicate_count": int(
+                                        tvdp_specs_by_solver[str(solver_key)]["tvdp_paper_duplicate_count"]
+                                    ),
+                                }
+                            ]
+                        },
+                    }
+                    for solver_key in solver_names
+                },
+            }
+        )
+
+    payload = {
+        "benchmark_family": "lob_conditional_generation",
+        "dataset": str(dataset),
+        "backbone_name": "otflow",
+        "field_network_type": str(field_network_type),
+        "rollout_mode": str(getattr(cfg, "rollout_mode", "autoregressive")),
+        "future_block_len": int(getattr(cfg, "prediction_horizon", 1)),
+        "checkpoint_id": str(checkpoint_id),
+        "checkpoint_path": str(ckpt_path),
+        "checkpoint_provenance": None if checkpoint_info is None else dict(checkpoint_info),
+        "eval_horizon": int(eval_horizon),
+        "target_nfe_values": [int(v) for v in target_nfe_values],
+        "solver_names": [str(name) for name in solver_names],
+        "schedule_names": [str(name) for name in schedule_names],
+        "tvdp_quantization_mode": _TVDP_QUANTIZATION_MODE,
+        "tvdp_reference_macro_steps": int(requested_tvdp_reference_macro_steps),
+        "rows": dataset_rows,
+        "selection_details": selection_details,
+        "row_record_paths": {
+            "jsonl": str(row_recorder["jsonl_path"]),
+            "csv": str(row_recorder["csv_path"]),
+        },
+        "registry": paper_registry_snapshot(),
+        "table_layout": table_layout_to_dict(build_lob_pilot_table_layout(target_nfe_values)),
+        "table_stub": markdown_header_stub(build_lob_pilot_table_layout(target_nfe_values)),
+        "main_table_layout": table_layout_to_dict(build_lob_table_layout(target_nfe_values)),
+        "main_table_stub": markdown_header_stub(build_lob_table_layout(target_nfe_values)),
+        "appendix_table_layout": table_layout_to_dict(build_lob_appendix_table_layout(target_nfe_values)),
+        "appendix_table_stub": markdown_header_stub(build_lob_appendix_table_layout(target_nfe_values)),
+    }
+    save_json(payload, str(out_dir / "pilot_summary.json"))
+    return payload
+
+
+def run_lob_prep(cli_args: argparse.Namespace) -> Dict[str, Any]:
+    out_root = Path(str(cli_args.out_root)).resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
+    target_nfe_values = _parse_ints(getattr(cli_args, "target_nfe_values", ",".join(str(v) for v in MAIN_NFE_VALUES)))
+    datasets = _parse_datasets(str(cli_args.datasets))
+    solver_names = _parse_ordered_names(str(getattr(cli_args, "solver_names", ",".join(MAIN_SOLVER_ORDER))), allowed=ALL_SOLVER_ORDER)
+    schedule_names = _parse_ordered_names(str(getattr(cli_args, "schedule_names", ",".join(MAIN_SCHEDULE_ORDER))), allowed=MAIN_SCHEDULE_ORDER)
+    rollout_mode = str(getattr(cli_args, "rollout_mode", "non_ar"))
+    future_block_len = int(getattr(cli_args, "future_block_len", 0))
+    score_main_only = bool(getattr(cli_args, "score_main_only", True))
+    row_jsonl_name = str(getattr(cli_args, "row_jsonl_name", "comparison_rows.jsonl"))
+    row_csv_name = str(getattr(cli_args, "row_csv_name", "comparison_rows.csv"))
+    resolved_future_block_lens = [
+        int(future_block_len if future_block_len > 0 else experiment_plan_by_key()[str(dataset)].future_block_len)
+        for dataset in datasets
+    ]
+    payload = {
+        "benchmark_family": "lob_conditional_generation",
+        "prep_only": True,
+        "backbone_name": "otflow",
+        "rollout_mode": rollout_mode,
+        "future_block_len": (
+            resolved_future_block_lens[0]
+            if len(set(resolved_future_block_lens)) == 1
+            else resolved_future_block_lens
+        ),
+        "solver_names": solver_names,
+        "schedule_names": schedule_names,
+        "datasets": [
+            {
+                "dataset_key": str(dataset),
+                "data_path": _dataset_data_path(cli_args, str(dataset)),
+                "checkpoint_source": _dataset_checkpoint_source(cli_args, str(dataset)),
+                "paper_backbone_preset": dict(get_otflow_paper_backbone_preset(str(dataset))),
+                "field_network_types": ["transformer"],
+                "rollout_mode": rollout_mode,
+                "future_block_len": int(
+                    future_block_len if future_block_len > 0 else experiment_plan_by_key()[str(dataset)].future_block_len
+                ),
+                "target_nfe_values": [int(v) for v in target_nfe_values],
+                "score_main_only_default": score_main_only,
+            }
+            for dataset in datasets
+        ],
+        "signals": {
+            "main_method": TVDP_SCHEDULE_KEY,
+            "matrix_schedules": schedule_names,
+            "tvdp_quantization_mode": _TVDP_QUANTIZATION_MODE,
+            "tvdp_reference_macro_steps": int(getattr(cli_args, "tvdp_reference_macro_steps", 0)),
+        },
+        "row_record_paths": {
+            "jsonl": str((out_root / row_jsonl_name).resolve()),
+            "csv": str((out_root / row_csv_name).resolve()),
+        },
+        "registry": paper_registry_snapshot(),
+        "table_layout": table_layout_to_dict(build_lob_pilot_table_layout(target_nfe_values)),
+        "table_stub": markdown_header_stub(build_lob_pilot_table_layout(target_nfe_values)),
+        "main_table_layout": table_layout_to_dict(build_lob_table_layout(target_nfe_values)),
+        "main_table_stub": markdown_header_stub(build_lob_table_layout(target_nfe_values)),
+        "appendix_table_layout": table_layout_to_dict(build_lob_appendix_table_layout(target_nfe_values)),
+        "appendix_table_stub": markdown_header_stub(build_lob_appendix_table_layout(target_nfe_values)),
+    }
+    (out_root / "lob_conditional_generation_prep_summary.json").write_text(
+        json.dumps(payload, indent=2), encoding="utf-8"
+    )
+    return payload
+
+
+def run_lob_backbone_training(cli_args: argparse.Namespace) -> Dict[str, Any]:
+    if not bool(cli_args.allow_execute):
+        return run_lob_prep(cli_args)
+
+    out_root = Path(str(cli_args.out_root)).resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
+    datasets = _parse_datasets(str(cli_args.datasets))
+    runs: List[Dict[str, Any]] = []
+    for dataset in datasets:
+        dataset_out_dir = out_root / str(dataset) / "transformer"
+        model, cfg, splits, ckpt_path = _train_or_resume(
+            cli_args,
+            str(dataset),
+            "transformer",
+            dataset_out_dir,
+            checkpoint_path=None,
+        )
+        del model
+        spec = experiment_plan_by_key()[str(dataset)]
+        metadata = {
+            "dataset_key": str(dataset),
+            "benchmark_family": "lob_conditional_generation",
+            "family_preset": "lob_shared_balanced",
+            "backbone_name": "otflow",
+            "field_network_type": "transformer",
+            "history_len": int(cfg.history_len),
+            "experiment_horizon": int(spec.experiment_horizon),
+            "future_block_len": int(cfg.prediction_horizon),
+            "rollout_mode": str(cfg.model.rollout_mode),
+            "normalization_mode": "dataset_level_train_split_standardize",
+            "time_features_enabled": bool(cfg.model.use_time_features),
+            "hidden_dim": int(cfg.hidden_dim),
+            "ctx_layers": int(cfg.model.ctx_layers),
+            "ctx_heads": int(cfg.model.ctx_heads),
+            "fu_net_layers": int(cfg.model.fu_net_layers),
+            "fu_net_heads": int(cfg.model.fu_net_heads),
+            "dropout": float(cfg.model.dropout),
+            "batch_size": int(cfg.batch_size),
+            "grad_accum_steps": int(getattr(cfg.train, "grad_accum_steps", 1)),
+            "train_steps": int(cfg.train.steps),
+            "checkpoint_path": str(ckpt_path),
+            "split_stats": dict(splits["stats"]),
+        }
+        save_json(metadata, str(dataset_out_dir / "checkpoint_metadata.json"))
+        runs.append(metadata)
+
+    payload = {
+        "benchmark_family": "lob_conditional_generation",
+        "comparison_mode": "backbone_training",
+        "datasets": runs,
+    }
+    save_json(payload, str(out_root / "lob_backbone_training_summary.json"))
+    return payload
+
+
+def run_lob_paper(cli_args: argparse.Namespace) -> Dict[str, Any]:
+    if not bool(cli_args.allow_execute):
+        return run_lob_prep(cli_args)
+
+    out_root = Path(str(cli_args.out_root)).resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
+    datasets = _parse_datasets(str(cli_args.datasets))
+    resolved_future_block_lens = [
+        int(
+            int(cli_args.future_block_len)
+            if int(getattr(cli_args, "future_block_len", 0)) > 0
+            else experiment_plan_by_key()[str(dataset)].future_block_len
+        )
+        for dataset in datasets
+    ]
+    target_nfe_values = _parse_ints(str(cli_args.target_nfe_values))
+    solver_names = _parse_ordered_names(str(cli_args.solver_names), allowed=ALL_SOLVER_ORDER)
+    schedule_names = _parse_ordered_names(str(cli_args.schedule_names), allowed=MAIN_SCHEDULE_ORDER)
+    row_recorder = _init_row_recorder(out_root, cli_args)
+    checkpoint_imports: Dict[str, Dict[str, Any]] = {}
+    for dataset in datasets:
+        checkpoint_info = _prepare_imported_checkpoint(
+            cli_args=cli_args,
+            dataset=str(dataset),
+            field_network_type="transformer",
+        )
+        if checkpoint_info is not None:
+            checkpoint_imports[str(dataset)] = checkpoint_info
+
+    transformer_runs: List[Dict[str, Any]] = []
+    for dataset in datasets:
+        dataset_out_dir = out_root / str(dataset) / "transformer"
+        transformer_runs.append(
+            _execute_dataset_matrix(
+                cli_args,
+                dataset=str(dataset),
+                field_network_type="transformer",
+                target_nfe_values=target_nfe_values,
+                solver_names=solver_names,
+                schedule_names=schedule_names,
+                out_dir=dataset_out_dir,
+                row_recorder=row_recorder,
+                checkpoint_info=checkpoint_imports.get(str(dataset)),
+            )
+        )
+
+    payload = {
+        "benchmark_family": "lob_conditional_generation",
+        "backbone_name": "otflow",
+        "pilot_mode": False,
+        "comparison_mode": "solver_schedule_cross_product",
+        "score_main_only": bool(cli_args.score_main_only),
+        "rollout_mode": str(cli_args.rollout_mode),
+        "future_block_len": (
+            resolved_future_block_lens[0]
+            if len(set(resolved_future_block_lens)) == 1
+            else resolved_future_block_lens
+        ),
+        "datasets": datasets,
+        "target_nfe_values": [int(v) for v in target_nfe_values],
+        "solver_names": solver_names,
+        "schedule_names": schedule_names,
+        "tvdp_quantization_mode": _TVDP_QUANTIZATION_MODE,
+        "tvdp_reference_macro_steps": int(getattr(cli_args, "tvdp_reference_macro_steps", 0)),
+        "transformer_runs": transformer_runs,
+        "checkpoint_imports": checkpoint_imports,
+        "row_record_paths": {
+            "jsonl": str(row_recorder["jsonl_path"]),
+            "csv": str(row_recorder["csv_path"]),
+        },
+        "registry": paper_registry_snapshot(),
+        "table_layout": table_layout_to_dict(build_lob_pilot_table_layout(target_nfe_values)),
+        "table_stub": markdown_header_stub(build_lob_pilot_table_layout(target_nfe_values)),
+        "main_table_layout": table_layout_to_dict(build_lob_table_layout(target_nfe_values)),
+        "main_table_stub": markdown_header_stub(build_lob_table_layout(target_nfe_values)),
+        "appendix_table_layout": table_layout_to_dict(build_lob_appendix_table_layout(target_nfe_values)),
+        "appendix_table_stub": markdown_header_stub(build_lob_appendix_table_layout(target_nfe_values)),
+    }
+    save_json(payload, str(out_root / "lob_conditional_generation_paper_summary.json"))
+    return payload
+
+
+def main() -> None:
+    run_lob_paper(build_argparser().parse_args())
+
+
+if __name__ == "__main__":
+    main()
