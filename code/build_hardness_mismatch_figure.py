@@ -12,8 +12,9 @@ from diffusion_flow_schedules import BASELINE_SCHEDULE_KEYS, TRANSFER_SCHEDULE_K
 from otflow_signal_traces import NATIVE_INFO_GROWTH_TRACE_KEY
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RESULTS_DIR = PROJECT_ROOT / "results" / "native_info_growth_hardness"
-DEFAULT_FIGURE_DIR = PROJECT_ROOT / "figures"
+DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs"
+DEFAULT_RESULTS_DIR = DEFAULT_OUTPUT_ROOT / "native_info_growth_hardness"
+DEFAULT_FIGURE_DIR = DEFAULT_OUTPUT_ROOT / "figures"
 DEFAULT_INPUT_JSON = DEFAULT_RESULTS_DIR / "native_info_growth_payload.json"
 DEFAULT_PNG = DEFAULT_FIGURE_DIR / "native_info_growth_schedule_trace.png"
 DEFAULT_PDF = DEFAULT_FIGURE_DIR / "native_info_growth_schedule_trace.pdf"

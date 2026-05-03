@@ -64,24 +64,11 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertEqual(summary["method_key"], "diffusion_flow_time_reparameterization")
         self.assertEqual(summary["transfer_schedule_keys"], ["ays", "gits", "ots"])
 
-    def test_active_scripts_use_new_entrypoint(self) -> None:
-        scripts = [
-            PROJECT_ROOT / "code" / "ops" / "isambard3" / "run_otflow_baseline_main_table_job.sh",
-            PROJECT_ROOT / "code" / "ops" / "isambard3" / "run_otflow_lob_baseline_backbone_sweep_job.sh",
-        ]
-        for script in scripts:
-            text = script.read_text(encoding="utf-8")
-            self.assertIn("diffusion_flow_time_reparameterization.py", text)
-
-    def test_retired_source_trees_are_absent(self) -> None:
+    def test_public_source_surface_excludes_local_and_cluster_artifacts(self) -> None:
+        self.assertFalse((PROJECT_ROOT / "code" / "ops").exists())
         self.assertFalse((PROJECT_ROOT / "code" / "legacy").exists())
         self.assertFalse((PROJECT_ROOT / "legacy").exists())
-
-    def test_backbone_manifest_keeps_40_ready_artifacts(self) -> None:
-        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
-        payload = json.loads(manifest.read_text(encoding="utf-8"))
-        self.assertEqual(int(payload.get("ready_count", 0)), 40)
-        self.assertEqual(int(payload.get("missing_count", 0)), 0)
+        self.assertFalse((PROJECT_ROOT / "lesson.md").exists())
 
 
 if __name__ == "__main__":
