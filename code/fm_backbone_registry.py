@@ -14,7 +14,7 @@ from otflow_medical_constants import (
     default_long_term_headered_ecg_manifest_path,
     default_sleep_edf_data_path,
 )
-from otflow_paths import project_data_root, project_paper_dataset_root, project_results_root, project_root
+from otflow_paths import project_backbone_matrix_root as default_project_backbone_matrix_root, project_data_root, project_outputs_root, project_paper_dataset_root
 
 FORECAST_FAMILY = "forecast_extrapolation"
 LOB_FAMILY = "lob_conditional_generation"
@@ -25,7 +25,7 @@ TRAIN_BUDGET_STEPS: Tuple[int, ...] = (4000, 8000, 12000, 16000, 20000)
 STANDARD_ARTIFACT_SUMMARY_NAME = "artifact_summary.json"
 MANIFEST_VERSION = "fm_backbone_manifest_v1"
 AUDIT_VERSION = "fm_backbone_readiness_audit_v1"
-IMPORTED_ISAMBARD_SOURCE_KIND = "imported_isambard"
+IMPORTED_EXTERNAL_SOURCE_KIND = "imported_external"
 
 ACTIVE_FORECAST_BACKBONE_BUDGETS: Mapping[str, Tuple[int, ...]] = {
     "san_francisco_traffic": (4000, 8000, 12000, 16000, 20000),
@@ -73,7 +73,7 @@ def train_budget_label(train_steps: int) -> str:
 
 
 def project_backbone_matrix_root() -> Path:
-    return project_root() / "TVD-result" / "results" / "backbone_matrix"
+    return default_project_backbone_matrix_root()
 
 
 def default_backbone_manifest_path() -> Path:
@@ -81,11 +81,11 @@ def default_backbone_manifest_path() -> Path:
 
 
 def default_otflow_reuse_root() -> Path:
-    return project_results_root() / "results_otflow_shared_backbone_training_fullhorizon_seed0_20260406"
+    return project_outputs_root() / "shared_backbones" / "otflow_fullhorizon_seed0"
 
 
 def default_imported_otflow_backbone_root() -> Path:
-    return project_root() / "checkpoints" / "imported_otflow_backbones_isambard_20260413"
+    return project_outputs_root() / "imported_backbones" / "otflow"
 
 
 def build_backbone_checkpoint_id(
@@ -696,7 +696,7 @@ __all__ = [
     "BACKBONE_NAME_OTFLOW",
     "DEFAULT_SEED",
     "FORECAST_FAMILY",
-    "IMPORTED_ISAMBARD_SOURCE_KIND",
+    "IMPORTED_EXTERNAL_SOURCE_KIND",
     "LOB_FAMILY",
     "LOB_FIELD_NETWORK_TYPE",
     "MANIFEST_VERSION",

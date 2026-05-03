@@ -15,13 +15,13 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RESULTS_DIR = PROJECT_ROOT / "results" / "adaptive_solver_matched_nfe_20260425"
-DEFAULT_LOB_RESULTS_DIR = PROJECT_ROOT / "results" / "adaptive_solver_matched_nfe_lob_20260428"
-DEFAULT_ZIP_PATH = PROJECT_ROOT / "results" / "20k.zip"
-DEFAULT_BACKBONE_MANIFEST = PROJECT_ROOT / "TVD-result" / "results" / "backbone_matrix" / "backbone_manifest.json"
-DEFAULT_FIGURE_DIR = PROJECT_ROOT / "figures"
-DEFAULT_LOB_BASELINE_ROWS_PATH = PROJECT_ROOT / "results" / "lob_baseline_main_3datasets_20260423" / "rows.jsonl"
-DEFAULT_REMOTE_LOB_BASELINE_ROWS_PATH = PROJECT_ROOT / "TVD-result" / "experiments" / "results_otflow_lob_baseline_main_3datasets_20260423" / "rows.jsonl"
+DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs"
+DEFAULT_RESULTS_DIR = DEFAULT_OUTPUT_ROOT / "adaptive_solver_matched_nfe"
+DEFAULT_LOB_RESULTS_DIR = DEFAULT_OUTPUT_ROOT / "adaptive_solver_matched_nfe_lob"
+DEFAULT_ZIP_PATH = DEFAULT_OUTPUT_ROOT / "20k.zip"
+DEFAULT_BACKBONE_MANIFEST = DEFAULT_OUTPUT_ROOT / "backbone_matrix" / "backbone_manifest.json"
+DEFAULT_FIGURE_DIR = DEFAULT_OUTPUT_ROOT / "figures"
+DEFAULT_LOB_BASELINE_ROWS_PATH = DEFAULT_OUTPUT_ROOT / "lob_baseline_main" / "rows.jsonl"
 DEFAULT_PLOT_POINTS_CSV = DEFAULT_RESULTS_DIR / "adaptive_matched_nfe_plot_points.csv"
 DEFAULT_PLOT_DIAGNOSTICS_JSON = DEFAULT_RESULTS_DIR / "adaptive_matched_nfe_plot_diagnostics.json"
 DEFAULT_PLOT_PNG = DEFAULT_FIGURE_DIR / "adaptive_matched_nfe_vs_target_performance_600dpi.png"
@@ -266,12 +266,7 @@ def lob_average_relative_score(
 
 
 def _resolve_lob_baseline_rows_path(rows_path: Path) -> Path:
-    path = Path(rows_path)
-    if path.exists():
-        return path
-    if path == DEFAULT_LOB_BASELINE_ROWS_PATH and DEFAULT_REMOTE_LOB_BASELINE_ROWS_PATH.exists():
-        return DEFAULT_REMOTE_LOB_BASELINE_ROWS_PATH
-    return path
+    return Path(rows_path)
 
 
 def extract_lob_fixed_targets(rows_path: Path = DEFAULT_LOB_BASELINE_ROWS_PATH) -> List[Dict[str, Any]]:

@@ -47,11 +47,11 @@ from otflow_evaluation_support import (
 )
 from otflow_paper_registry import METHOD_KEY
 from otflow_paper_tables import augment_rows_with_relative_metrics
-from otflow_paths import project_paper_dataset_root, project_root
+from otflow_paths import default_backbone_manifest_path, project_outputs_root, project_paper_dataset_root, project_root, resolve_project_path
 from otflow_train_val import save_json
 
 RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_v1"
-DEFAULT_OUT_ROOT = project_root() / "TVD-result" / "experiments" / "results_diffusion_flow_time_reparameterization"
+DEFAULT_OUT_ROOT = project_outputs_root() / "diffusion_flow_time_reparameterization"
 DEFAULT_TARGET_NFE_VALUES: Tuple[int, ...] = (10, 12, 16)
 DEFAULT_SEEDS: Tuple[int, ...] = (0, 1, 2)
 DEFAULT_SCHEDULES: Tuple[str, ...] = BASELINE_SCHEDULE_KEYS
@@ -441,10 +441,10 @@ def _prep_summary(cli_args: argparse.Namespace) -> Dict[str, Any]:
     schedules = _parse_schedule_names(str(cli_args.baseline_scheduler_names))
     solvers = parse_csv(str(cli_args.solver_names))
     nfes = parse_int_csv(str(cli_args.target_nfe_values))
-    manifest_path = Path(str(cli_args.backbone_manifest)).expanduser() if str(cli_args.backbone_manifest).strip() else None
+    manifest_path = resolve_project_path(str(cli_args.backbone_manifest)) if str(cli_args.backbone_manifest).strip() else None
     manifest_summary: Dict[str, Any] = {"path": None, "ready_count": None, "missing_count": None}
     if manifest_path is not None:
-        resolved = manifest_path if manifest_path.is_absolute() else project_root() / manifest_path
+        resolved = manifest_path
         manifest_summary["path"] = str(resolved)
         if resolved.exists():
             payload = json.loads(resolved.read_text(encoding="utf-8"))
@@ -458,7 +458,7 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--out_root", type=str, default=str(DEFAULT_OUT_ROOT))
     ap.add_argument("--dataset_root", type=str, default=str(project_paper_dataset_root()))
     ap.add_argument("--shared_backbone_root", type=str, default=str(DEFAULT_SHARED_BACKBONE_ROOT))
-    ap.add_argument("--backbone_manifest", type=str, default="")
+    ap.add_argument("--backbone_manifest", type=str, default=str(default_backbone_manifest_path()))
     ap.add_argument("--otflow_train_steps", type=int, default=20000)
     ap.add_argument("--steps", type=int, default=0)
     ap.add_argument("--forecast_datasets", type=str, default=",".join(DEFAULT_FORECAST_DATASETS))
@@ -490,7 +490,6 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--row_csv_name", type=str, default="rows.csv")
     ap.add_argument("--resume", action="store_true", default=True)
     ap.add_argument("--no_resume", dest="resume", action="store_false")
-    ap.add_argument("--baseline_only", action="store_true", default=False, help="Compatibility flag; all active schedules are fixed diffusion-flow schedules.")
     ap.add_argument("--diagnose_locked_forecast_only", action="store_true", default=False)
     ap.add_argument("--allow_execute", action="store_true", default=False)
     return ap

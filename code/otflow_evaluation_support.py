@@ -35,6 +35,7 @@ from otflow_paths import (
     default_es_mbp_10_data_path,
     default_sleep_edf_data_path,
     project_results_root,
+    resolve_project_path,
 )
 from otflow_signal_traces import (
     NATIVE_INFO_GROWTH_TRACE_KEY,
@@ -51,7 +52,7 @@ LOCKED_TEST_PHASE = "locked_test"
 UNIFORM_SCHEDULER_KEY = "uniform"
 DEFAULT_SIGNAL_TRACE_KEY = NATIVE_INFO_GROWTH_TRACE_KEY
 DEFAULT_SHARED_BACKBONE_ROOT = (
-    project_results_root() / "results_otflow_shared_backbone_training_fullhorizon_seed0_20260406"
+    project_results_root() / "shared_backbones" / "otflow_fullhorizon_seed0"
 )
 LOB_FIELD_NETWORK_TYPE = "transformer"
 LOB_TRAIN_STEPS = 20_000
@@ -176,7 +177,7 @@ def _resolved_backbone_manifest_path(cli_args: argparse.Namespace) -> Optional[P
     raw = str(getattr(cli_args, "backbone_manifest", "") or "").strip()
     if not raw:
         return None
-    path = Path(raw).expanduser().resolve()
+    path = resolve_project_path(raw)
     if not path.exists():
         return None
     return path

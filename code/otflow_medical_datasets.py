@@ -23,7 +23,7 @@ from otflow_medical_constants import (
     default_sleep_edf_metadata_path,
 )
 
-DEFAULT_MEDICAL_STAGING_ROOT = Path("/home/yzn/work/medical data")
+DEFAULT_MEDICAL_STAGING_ROOT: Path | None = None
 
 LONG_TERM_ECG_FREQUENCY_LABEL = "250_hz"
 LONG_TERM_ECG_SAMPLING_RATE_HZ = 250.0
@@ -52,7 +52,7 @@ def medical_staging_root() -> Path:
     raw = str(os.environ.get("OTFLOW_MEDICAL_STAGING_ROOT", "") or "").strip()
     if raw:
         return Path(raw).expanduser().resolve()
-    return DEFAULT_MEDICAL_STAGING_ROOT
+    raise RuntimeError("Set OTFLOW_MEDICAL_STAGING_ROOT to prepare raw medical datasets.")
 
 
 def long_term_headered_ecg_source_dir() -> Path:
