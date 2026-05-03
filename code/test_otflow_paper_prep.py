@@ -44,7 +44,7 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         self.assertIn("info_growth_hardness_by_step", NATIVE_SIGNAL_TRACE_KEYS)
 
     def test_runner_dry_run_writes_combined_summary(self) -> None:
-        manifest = PROJECT_ROOT / "TVD-result" / "results" / "backbone_matrix" / "backbone_manifest.json"
+        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
         with tempfile.TemporaryDirectory() as tmpdir:
             args = runner.build_argparser().parse_args(
                 [
@@ -72,22 +72,13 @@ class DiffusionFlowPaperPrepTests(unittest.TestCase):
         for script in scripts:
             text = script.read_text(encoding="utf-8")
             self.assertIn("diffusion_flow_time_reparameterization.py", text)
-            self.assertNotIn("otflow_canonical_only_study.py", text)
 
-    def test_no_active_imports_from_archived_canonical_modules(self) -> None:
-        offenders = []
-        for path in (PROJECT_ROOT / "code").rglob("*.py"):
-            if "__pycache__" in path.parts or "legacy" in path.parts:
-                continue
-            for line in path.read_text(encoding="utf-8").splitlines():
-                stripped = line.strip()
-                if (stripped.startswith("import ") or stripped.startswith("from ")) and "otflow_canonical_only" in stripped:
-                    offenders.append(str(path.relative_to(PROJECT_ROOT)))
-                    break
-        self.assertEqual(offenders, [])
+    def test_retired_source_trees_are_absent(self) -> None:
+        self.assertFalse((PROJECT_ROOT / "code" / "legacy").exists())
+        self.assertFalse((PROJECT_ROOT / "legacy").exists())
 
     def test_backbone_manifest_keeps_40_ready_artifacts(self) -> None:
-        manifest = PROJECT_ROOT / "TVD-result" / "results" / "backbone_matrix" / "backbone_manifest.json"
+        manifest = PROJECT_ROOT / "outputs" / "backbone_matrix" / "backbone_manifest.json"
         payload = json.loads(manifest.read_text(encoding="utf-8"))
         self.assertEqual(int(payload.get("ready_count", 0)), 40)
         self.assertEqual(int(payload.get("missing_count", 0)), 0)

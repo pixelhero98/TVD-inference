@@ -1,6 +1,6 @@
 """otflow_train_val.py
 
-Training + evaluation utilities for OTFlow and legacy baselines.
+Training and evaluation utilities for OTFlow backbones.
 
 Adds evaluation helpers:
 - Real-vs-real comparison metrics (distribution + temporal + validity)

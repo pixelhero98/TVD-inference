@@ -1,3 +1,4 @@
+
 # Python/runtime caches
 __pycache__/
 .pytest_cache/
@@ -12,14 +13,14 @@ venv/
 
 # Generated or large project artifacts
 data/
+paper_datasets/
+outputs/
 results/
 figures/
-TVD-result/
 checkpoints/
 tables/
 progress_snapshot/
 safe_resume_patch/
-TVD-medic-data/
 *.zip
 *.tar
 *.tar.gz
@@ -31,9 +32,3 @@ TVD-medic-data/
 *.log
 .log
 tmp_*
-
-# Legacy archive payloads that are preserved locally but too large/generated for GitHub
-legacy/**/moved/figures/
-legacy/**/moved/results/
-legacy/**/moved/TVD-result/
-legacy/**/moved/checkpoints/

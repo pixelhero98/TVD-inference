@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import os
@@ -12,6 +13,13 @@ def project_root() -> Path:
     return code_root().parent
 
 
+def resolve_project_path(path: str | Path) -> Path:
+    raw = Path(path).expanduser()
+    if raw.is_absolute():
+        return raw.resolve()
+    return (project_root() / raw).resolve()
+
+
 def project_data_root() -> Path:
     return project_root() / "data"
 
@@ -20,19 +28,31 @@ def project_paper_dataset_root() -> Path:
     return project_root() / "paper_datasets"
 
 
+def project_outputs_root() -> Path:
+    return project_root() / "outputs"
+
+
 def project_results_root() -> Path:
-    return project_root() / "results"
+    return project_outputs_root()
+
+
+def project_backbone_matrix_root() -> Path:
+    return project_outputs_root() / "backbone_matrix"
+
+
+def default_backbone_manifest_path() -> Path:
+    return project_backbone_matrix_root() / "backbone_manifest.json"
 
 
 def project_checkpoint_import_root() -> Path:
-    return project_root() / "checkpoints" / "imported_otflow_schedule_12k"
+    return project_outputs_root() / "imported_backbones"
 
 
 def project_medical_staging_root() -> Path:
     raw = str(os.environ.get("OTFLOW_MEDICAL_STAGING_ROOT", "") or "").strip()
-    if raw:
-        return Path(raw).expanduser().resolve()
-    return Path("/home/yzn/work/medical data")
+    if not raw:
+        raise RuntimeError("Set OTFLOW_MEDICAL_STAGING_ROOT to prepare raw medical datasets.")
+    return Path(raw).expanduser().resolve()
 
 
 def default_cryptos_data_path() -> str:

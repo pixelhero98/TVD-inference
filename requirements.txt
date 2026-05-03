@@ -1,15 +1,9 @@
-# Pip/uv fallback dependencies for the TVD-Scheduler handoff bundle.
-#
-# Tested against the active remote study on yzn3090:
-# - Python 3.11.15
-# - numpy 2.4.2
-# - torch 2.10.0+cu130
-#
-# Conda users should prefer `environment.conda.yml` in this folder for a
-# one-shot environment create. This file intentionally avoids the CUDA-local
-# `+cu130` build tag so it can also be used with uv/pip on non-conda setups.
+
+# Runtime dependencies for Diffusion-Flow-Inference.
+# Install with: python -m pip install -r requirements.txt
 
 numpy==2.4.2
+scipy>=1.11
 matplotlib>=3.8,<4
 torch==2.10.0
 wfdb>=4.1

@@ -17,14 +17,15 @@ import numpy as np
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RESULTS_DIR = PROJECT_ROOT / "results" / "ptg_observed_gain_20260425"
+DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs"
+DEFAULT_RESULTS_DIR = DEFAULT_OUTPUT_ROOT / "ptg_observed_gain"
 DEFAULT_INPUT_JSON = DEFAULT_RESULTS_DIR / "ptg_observed_gain_inputs.json"
 DEFAULT_POINTS_CSV = DEFAULT_RESULTS_DIR / "ptg_observed_gain_points.csv"
 DEFAULT_DIAGNOSTICS_JSON = DEFAULT_RESULTS_DIR / "ptg_diagnostics.json"
 DEFAULT_INTEGRATION_ROWS_CSV = DEFAULT_RESULTS_DIR / "ptg_integration_error_rows.csv"
 DEFAULT_INTEGRATION_SEED_STATS_CSV = DEFAULT_RESULTS_DIR / "ptg_integration_error_seed_stats.csv"
-DEFAULT_ZIP_PATH = PROJECT_ROOT / "results" / "20k.zip"
-DEFAULT_FIGURE_DIR = PROJECT_ROOT / "figures"
+DEFAULT_ZIP_PATH = DEFAULT_OUTPUT_ROOT / "20k.zip"
+DEFAULT_FIGURE_DIR = DEFAULT_OUTPUT_ROOT / "figures"
 DEFAULT_PNG = DEFAULT_FIGURE_DIR / "ptg_vs_observed_gain_forecast_20k_times_600dpi.png"
 DEFAULT_PDF = DEFAULT_FIGURE_DIR / "ptg_vs_observed_gain_forecast_20k_times_600dpi.pdf"
 DEFAULT_DIAGNOSTIC_PNG = DEFAULT_FIGURE_DIR / "ptg_vs_observed_gain_forecast_20k_times_600dpi_diagnostic.png"
@@ -346,7 +347,7 @@ def _runner_cli_args(args: argparse.Namespace) -> argparse.Namespace:
         "--eval_windows_val",
         str(int(getattr(args, "val_windows", DEFAULT_VALIDATION_WINDOWS))),
     ]
-    backbone_manifest = str(getattr(args, "backbone_manifest", "TVD-result/results/backbone_matrix/backbone_manifest.json"))
+    backbone_manifest = str(getattr(args, "backbone_manifest", "outputs/backbone_matrix/backbone_manifest.json"))
     if backbone_manifest.strip():
         argv.extend(["--backbone_manifest", str(_project_relative_path(backbone_manifest))])
     return build_argparser().parse_args(argv)
@@ -1508,7 +1509,7 @@ def build_argparser() -> argparse.ArgumentParser:
     collect.add_argument("--val-windows", type=int, default=DEFAULT_VALIDATION_WINDOWS)
     collect.add_argument("--reference-macro-factor", type=float, default=DEFAULT_REFERENCE_MACRO_FACTOR)
     collect.add_argument("--calibration-trace-samples", type=int, default=DEFAULT_CALIBRATION_TRACE_SAMPLES)
-    collect.add_argument("--backbone-manifest", type=str, default="TVD-result/results/backbone_matrix/backbone_manifest.json")
+    collect.add_argument("--backbone-manifest", type=str, default="outputs/backbone_matrix/backbone_manifest.json")
     collect.add_argument("--device", type=str, default="cuda")
     collect.add_argument("--smoke", action="store_true", help="Collect the first dataset/solver/NFE/seed with a tiny window cap.")
 
@@ -1526,7 +1527,7 @@ def build_argparser() -> argparse.ArgumentParser:
     integration.add_argument("--test-windows", type=int, default=DEFAULT_TEST_WINDOWS)
     integration.add_argument("--integration-batch-size", type=int, default=64)
     integration.add_argument("--dense-reference-macro-factor", type=float, default=DEFAULT_DENSE_REFERENCE_MACRO_FACTOR)
-    integration.add_argument("--backbone-manifest", type=str, default="TVD-result/results/backbone_matrix/backbone_manifest.json")
+    integration.add_argument("--backbone-manifest", type=str, default="outputs/backbone_matrix/backbone_manifest.json")
     integration.add_argument("--device", type=str, default="cuda")
     integration.add_argument("--resume", action="store_true", help="Skip seed cells already present in --rows-csv.")
     integration.add_argument("--smoke", action="store_true", help="Collect one tiny integration-error cell.")

@@ -1,16 +1,17 @@
+
 #!/bin/bash
 set -euo pipefail
 
-module load cray-python/3.11.7
+module load cray-python/3.11.7 2>/dev/null || true
 
-projectdir="${PROJECTDIR:-/projects/b35z}"
-scratchdir="${SCRATCHDIR:-/scratch/b35z/$(id -un)}"
-project_root="${projectdir}/tvd-scheduler"
-repo_root="${project_root}/TVD-Scheduler"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="${REPO_ROOT:-$(cd "${script_dir}/../../.." && pwd)}"
+output_root="${OUTPUT_ROOT:-${repo_root}/outputs}"
 code_root="${repo_root}/code"
-venv_dir="${project_root}/.venv"
-manifest_path="${repo_root}/TVD-result/results/backbone_matrix/backbone_manifest.json"
-out_base="${repo_root}/TVD-result/experiments/results_otflow_baseline_main_table_20k"
+venv_dir="${VENV_DIR:-${repo_root}/.venv}"
+manifest_path="${BACKBONE_MANIFEST:-${output_root}/backbone_matrix/backbone_manifest.json}"
+out_base="${OTFLOW_OUT_BASE:-${output_root}/experiments/otflow_baseline_main_table_20k}"
+scratch_base="${SCRATCHDIR:-${TMPDIR:-/tmp}}"
 
 datasets=(
   "forecast_extrapolation:wind_farms_wo_missing"
@@ -32,13 +33,13 @@ fi
 entry="${datasets[${dataset_index}]}"
 family="${entry%%:*}"
 dataset="${entry#*:}"
-scratch_job_root="${scratchdir}/tvd-scheduler/${SLURM_JOB_ID:-manual}-${dataset}"
+scratch_job_root="${scratch_base}/diffusion-flow-inference/${SLURM_JOB_ID:-manual}-${dataset}"
 out_root="${OTFLOW_OUT_ROOT:-${out_base}/${dataset}}"
 
 mkdir -p "${scratch_job_root}" "${out_root}"
 
 if [[ ! -f "${venv_dir}/bin/activate" ]]; then
-  echo "Missing virtual environment at ${venv_dir}. Run code/ops/isambard3/bootstrap_tvd_scheduler_venv.sh first." >&2
+  echo "Missing virtual environment at ${venv_dir}. Run code/ops/isambard3/bootstrap_env.sh first." >&2
   exit 1
 fi
 if [[ ! -f "${manifest_path}" ]]; then
@@ -61,7 +62,7 @@ fi
 
 solver_names="${OTFLOW_SOLVER_NAMES:-euler,heun,midpoint_rk2,dpmpp2m}"
 target_nfe_values="${OTFLOW_TARGET_NFE_VALUES:-10,12,16}"
-baseline_scheduler_names="${OTFLOW_BASELINE_SCHEDULER_NAMES:-uniform,late_power_3,ays,gits,ots}"
+scheduler_names="${OTFLOW_SCHEDULER_NAMES:-uniform,late_power_3,ays,gits,ots}"
 seeds="${OTFLOW_SEEDS:-0,1,2}"
 num_eval_samples="${OTFLOW_NUM_EVAL_SAMPLES:-25}"
 eval_windows_val="${OTFLOW_EVAL_WINDOWS_VAL:-0}"
@@ -72,14 +73,9 @@ echo "FAMILY=${family}"
 echo "DATASET=${dataset}"
 echo "OUT_ROOT=${out_root}"
 echo "MANIFEST=${manifest_path}"
-echo "SOLVERS=${solver_names}"
-echo "NFES=${target_nfe_values}"
-echo "BASELINES=${baseline_scheduler_names}"
-echo "SEEDS=${seeds}"
-nvidia-smi
+if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi; fi
 
 python diffusion_flow_time_reparameterization.py \
-  --baseline_only \
   --allow_execute \
   --out_root "${out_root}" \
   --dataset_root "${repo_root}/paper_datasets" \
@@ -92,7 +88,7 @@ python diffusion_flow_time_reparameterization.py \
   --sleep_edf_path "${repo_root}/data/sleep_edf_3ch_100hz_stage_conditioned.npz" \
   --solver_names "${solver_names}" \
   --target_nfe_values "${target_nfe_values}" \
-  --baseline_scheduler_names "${baseline_scheduler_names}" \
+  --baseline_scheduler_names "${scheduler_names}" \
   --seeds "${seeds}" \
   --num_eval_samples "${num_eval_samples}" \
   --eval_windows_val "${eval_windows_val}" \
