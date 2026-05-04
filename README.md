@@ -3,13 +3,15 @@
 
 Diffusion-Flow-Inference evaluates optimized diffusion schedules after mapping them onto normalized flow time for fixed OTFlow backbones. The active schedules are `uniform`, `late_power_3`, `ays`, `gits`, and `ots`; the transferred diffusion schedules are `ays`, `gits`, and `ots`.
 
-## Active Code Path
+## Package Layout
 
-- `code/diffusion_flow_time_reparameterization.py`: fixed-schedule evaluation entrypoint.
-- `code/diffusion_flow_schedules.py`: schedule construction for uniform, late-power-3, AYS, GITS, and OTS.
-- `code/otflow_evaluation_support.py`: checkpoint loading, dataset split resolution, solver mappings, and metric helpers.
-- `code/otflow_paper_registry.py`: method, schedule, and solver registry.
-- `code/otflow_model.py`, `code/conditioning.py`, `code/config.py`, `code/modules.py`, and `code/otflow_train_val.py`: OTFlow backbone model and training/evaluation utilities.
+- `diffusion_flow_inference.datasets`: dataset settings, loaders, audits, and experiment plans.
+- `diffusion_flow_inference.backbones.settings`: backbone configs, modules, model definitions, and baseline architectures.
+- `diffusion_flow_inference.backbones.training`: backbone training, benchmarking, readiness audits, and manifest registry.
+- `diffusion_flow_inference.schedules`: diffusion-to-flow schedule construction and schedule registry.
+- `diffusion_flow_inference.solvers`: solver runtime settings.
+- `diffusion_flow_inference.evaluation`: fixed-schedule evaluation, metric support, and paper table helpers.
+- `diffusion_flow_inference.diagnostics`: PTG, adaptive-solver, hardness, and signal-trace diagnostics.
 
 ## Data, Outputs, And Backbones
 
@@ -34,7 +36,7 @@ If you have a prepared local backbone matrix, it should report 40 ready checkpoi
 Pip:
 
 ```bash
-python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
 Conda:
@@ -47,15 +49,14 @@ Raw medical dataset preparation requires `OTFLOW_MEDICAL_STAGING_ROOT` to point 
 
 ## CPU Smoke Checks
 
-Run the public, artifact-independent smoke tests from `code/` with your active Python environment:
+Run the public, artifact-independent smoke tests with your active Python environment:
 
 ```bash
-cd code
-CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 python -m unittest -q test_backbone_matrix test_otflow_paper_prep test_ptg_observed_gain_figure test_adaptive_solver_matched_nfe_study test_hardness_mismatch_figure
+CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -q
 ```
 
-If you have local datasets and backbone artifacts, dry-run prep from either the repository root or `code/` accepts the same project-relative manifest path:
+If you have local datasets and backbone artifacts, dry-run prep accepts the project-relative manifest path:
 
 ```bash
-CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 python code/diffusion_flow_time_reparameterization.py --forecast_datasets '' --lob_datasets '' --backbone_manifest outputs/backbone_matrix/backbone_manifest.json
+CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 python -m diffusion_flow_inference.evaluation.diffusion_flow_time_reparameterization --forecast_datasets '' --lob_datasets '' --backbone_manifest outputs/backbone_matrix/backbone_manifest.json
 ```
