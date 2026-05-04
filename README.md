@@ -15,16 +15,15 @@ Diffusion-Flow-Inference evaluates optimized diffusion schedules after mapping t
 
 ## Data, Outputs, And Backbones
 
-This repository is source-only. Local runs may use `data/`, `paper_datasets/`, `outputs/`, and a virtual environment such as `.venv/`, but those large or machine-local directories are intentionally ignored and are not part of the public source tree.
+This repository is source-only. Large datasets, generated outputs, trained backbone artifacts, and local virtual environments are intentionally not committed.
 
-The processed experiment datasets can be kept as an external zip instead of checked into Git. The local bundle prepared for the experiments is:
+A reduced public processed-data bundle for review is available on Hugging Face:
 
-- File: `diffusion_flow_processed_datasets.zip`
-- Size: 2,908,513,477 bytes (2.71 GiB)
-- SHA256: `17e31b4c0c313d977c14bfba4c781f6d10812d605b91266cfb612c499f3356ed`
-- Contents: processed `data/` files plus Monash `paper_datasets/` sources/manifests; raw Monash download zips are excluded.
+```text
+https://huggingface.co/datasets/pixelhero98/d2f-dataset
+```
 
-This bundle is too large for a GitHub source PR and should be distributed through an external artifact store rather than committed to the repository.
+The Hugging Face bundle includes the cryptos processed file and processed Monash manifests, audits, and `.tsf` sources. It excludes ES MBP-10, Sleep-EDF, raw Monash download zips, and other restricted or machine-local artifacts.
 
 Generated outputs default to:
 
@@ -32,13 +31,7 @@ Generated outputs default to:
 outputs/
 ```
 
-The default backbone manifest path is:
-
-```text
-outputs/backbone_matrix/backbone_manifest.json
-```
-
-If you have a prepared local backbone matrix, it should report 40 ready checkpoint artifacts and 0 missing artifacts. The public smoke tests do not require those private/local artifacts.
+Backbones are trained or retrained locally with the package training workflow, then evaluated using the generated artifacts under `outputs/`.
 
 ## Environment
 
@@ -54,7 +47,7 @@ Conda:
 conda env create -f environment.conda.yml
 ```
 
-Raw medical dataset preparation requires `OTFLOW_MEDICAL_STAGING_ROOT` to point at the local staging directory. Prepared dataset evaluation uses the processed files in `data/`.
+Raw medical dataset preparation requires `OTFLOW_MEDICAL_STAGING_ROOT` to point at the local staging directory. For the public review subset, download the processed bundle from Hugging Face and pass it to the evaluation runner.
 
 ## CPU Smoke Checks
 
@@ -64,19 +57,23 @@ Run the public, artifact-independent smoke tests with your active Python environ
 CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -q
 ```
 
-If you have local datasets and backbone artifacts, dry-run prep accepts the project-relative manifest path:
+Download the public review bundle from Hugging Face with your active Python environment. If needed, install the lightweight Hub client with `python -m pip install huggingface_hub`.
 
-```bash
-CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 python -m diffusion_flow_inference.evaluation.diffusion_flow_time_reparameterization --forecast_datasets '' --lob_datasets '' --backbone_manifest outputs/backbone_matrix/backbone_manifest.json
+```python
+from huggingface_hub import hf_hub_download
+
+bundle = hf_hub_download(
+    repo_id="pixelhero98/d2f-dataset",
+    filename="d2f_review_processed_datasets_public.zip",
+    repo_type="dataset",
+)
 ```
 
-To evaluate from an external processed dataset bundle, pass the zip path and let the runner extract it under `outputs/` when local processed inputs are missing:
+Pass the downloaded zip path to the evaluation runner and let it extract processed inputs under `outputs/`:
 
 ```bash
 CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 python -m diffusion_flow_inference.evaluation.diffusion_flow_time_reparameterization \
-  --dataset_bundle_zip /path/to/diffusion_flow_processed_datasets.zip \
+  --dataset_bundle_zip /path/to/d2f_review_processed_datasets_public.zip \
   --dataset_bundle_mode auto \
-  --dataset_bundle_extract_root outputs/dataset_bundles/extracted \
-  --backbone_manifest outputs/backbone_matrix/backbone_manifest.json \
-  --allow_execute
+  --dataset_bundle_extract_root outputs/dataset_bundles/extracted
 ```
