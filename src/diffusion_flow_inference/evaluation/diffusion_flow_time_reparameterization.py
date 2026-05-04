@@ -47,11 +47,22 @@ from diffusion_flow_inference.evaluation.support import (
 )
 from diffusion_flow_inference.schedules.paper_registry import METHOD_KEY
 from diffusion_flow_inference.evaluation.paper_tables import augment_rows_with_relative_metrics
-from diffusion_flow_inference.common.paths import default_backbone_manifest_path, project_outputs_root, project_paper_dataset_root, project_root, resolve_project_path
+from diffusion_flow_inference.common.paths import (
+    default_backbone_manifest_path,
+    default_cryptos_data_path,
+    default_es_mbp_10_data_path,
+    default_sleep_edf_data_path,
+    project_outputs_root,
+    project_paper_dataset_root,
+    project_root,
+    resolve_project_path,
+)
+from diffusion_flow_inference.datasets.bundles import ensure_processed_dataset_bundle
 from diffusion_flow_inference.backbones.training.train_val import save_json
 
 RUNNER_SIGNATURE_VERSION = "diffusion_flow_time_reparameterization_v1"
 DEFAULT_OUT_ROOT = project_outputs_root() / "diffusion_flow_time_reparameterization"
+DEFAULT_DATASET_BUNDLE_EXTRACT_ROOT = project_outputs_root() / "dataset_bundles" / "extracted"
 DEFAULT_TARGET_NFE_VALUES: Tuple[int, ...] = (10, 12, 16)
 DEFAULT_SEEDS: Tuple[int, ...] = (0, 1, 2)
 DEFAULT_SCHEDULES: Tuple[str, ...] = BASELINE_SCHEDULE_KEYS
@@ -146,6 +157,75 @@ def _parse_schedule_names(text: str) -> List[str]:
     if unknown:
         raise ValueError(f"Unknown active diffusion-flow schedules: {unknown}")
     return names
+
+
+def _path_matches_project_default(path: Path, default_path: Path) -> bool:
+    try:
+        return path.resolve() == default_path.resolve()
+    except OSError:
+        return False
+
+
+def _selected_lob_data_paths(cli_args: argparse.Namespace) -> Dict[str, Path]:
+    selected = set(parse_lob_datasets(str(cli_args.lob_datasets)))
+    paths: Dict[str, Path] = {}
+    cryptos_path = str(getattr(cli_args, "cryptos_path", "") or "").strip()
+    es_path = str(getattr(cli_args, "es_path", "") or "").strip()
+    sleep_edf_path = str(getattr(cli_args, "sleep_edf_path", "") or "").strip()
+    if "cryptos" in selected:
+        paths["cryptos"] = resolve_project_path(cryptos_path) if cryptos_path else Path(default_cryptos_data_path())
+    if "es_mbp_10" in selected:
+        paths["es_mbp_10"] = resolve_project_path(es_path) if es_path else Path(default_es_mbp_10_data_path())
+    if "sleep_edf" in selected:
+        paths["sleep_edf"] = resolve_project_path(sleep_edf_path) if sleep_edf_path else Path(default_sleep_edf_data_path())
+    return paths
+
+
+def _apply_dataset_bundle(cli_args: argparse.Namespace) -> argparse.Namespace:
+    bundle_zip = str(getattr(cli_args, "dataset_bundle_zip", "") or "").strip()
+    mode = str(getattr(cli_args, "dataset_bundle_mode", "auto") or "auto").strip().lower()
+    if mode == "none" or not bundle_zip:
+        setattr(cli_args, "_dataset_bundle_resolution", {"mode": mode, "used": False, "zip_path": bundle_zip or None})
+        return cli_args
+
+    lob_paths = _selected_lob_data_paths(cli_args)
+    original_dataset_root = resolve_project_path(str(cli_args.dataset_root))
+    result = ensure_processed_dataset_bundle(
+        bundle_zip=bundle_zip,
+        extract_root=str(getattr(cli_args, "dataset_bundle_extract_root", DEFAULT_DATASET_BUNDLE_EXTRACT_ROOT)),
+        mode=mode,
+        dataset_root=original_dataset_root,
+        data_paths=list(lob_paths.values()),
+    )
+    if result is None:
+        setattr(cli_args, "_dataset_bundle_resolution", {"mode": mode, "used": False, "zip_path": str(resolve_project_path(bundle_zip))})
+        return cli_args
+
+    paper_root = Path(result["paper_dataset_root"])
+    data_root = Path(result["data_root"])
+    if mode == "extract" or not original_dataset_root.exists() or _path_matches_project_default(original_dataset_root, project_paper_dataset_root()):
+        cli_args.dataset_root = str(paper_root)
+    if mode == "extract" or ("cryptos" in lob_paths and not lob_paths["cryptos"].exists()):
+        cli_args.cryptos_path = str(data_root / "cryptos_binance_spot_monthly_1s_l10.npz")
+    if mode == "extract" or ("es_mbp_10" in lob_paths and not lob_paths["es_mbp_10"].exists()):
+        cli_args.es_path = str(data_root / "es_mbp_10.npz")
+    if mode == "extract" or ("sleep_edf" in lob_paths and not lob_paths["sleep_edf"].exists()):
+        cli_args.sleep_edf_path = str(data_root / "sleep_edf_3ch_100hz_stage_conditioned.npz")
+    setattr(
+        cli_args,
+        "_dataset_bundle_resolution",
+        {
+            "mode": mode,
+            "used": True,
+            "extracted": bool(result.get("extracted", False)),
+            "zip_path": str(result["bundle_zip"]),
+            "extract_root": str(result["extract_root"]),
+            "data_root": str(result["data_root"]),
+            "paper_dataset_root": str(result["paper_dataset_root"]),
+            "file_count": int(result["manifest"]["file_count"]),
+        },
+    )
+    return cli_args
 
 
 def _realized_nfe_for_solver(solver_key: str, runtime_nfe: int) -> int:
@@ -450,13 +530,16 @@ def _prep_summary(cli_args: argparse.Namespace) -> Dict[str, Any]:
             payload = json.loads(resolved.read_text(encoding="utf-8"))
             manifest_summary["ready_count"] = int(payload.get("ready_count", 0))
             manifest_summary["missing_count"] = int(payload.get("missing_count", 0))
-    return {"runner_mode": "diffusion_flow_time_reparameterization", "runner_signature": RUNNER_SIGNATURE_VERSION, "method_key": METHOD_KEY, "baseline_schedule_keys": list(BASELINE_SCHEDULE_KEYS), "transfer_schedule_keys": list(TRANSFER_SCHEDULE_KEYS), "scheduled_evaluation_keys": schedules, "solver_names": solvers, "target_nfe_values": nfes, "forecast_datasets": parse_forecast_datasets(str(cli_args.forecast_datasets)), "lob_datasets": parse_lob_datasets(str(cli_args.lob_datasets)), "backbone_manifest": manifest_summary, "allow_execute": bool(getattr(cli_args, "allow_execute", False))}
+    return {"runner_mode": "diffusion_flow_time_reparameterization", "runner_signature": RUNNER_SIGNATURE_VERSION, "method_key": METHOD_KEY, "baseline_schedule_keys": list(BASELINE_SCHEDULE_KEYS), "transfer_schedule_keys": list(TRANSFER_SCHEDULE_KEYS), "scheduled_evaluation_keys": schedules, "solver_names": solvers, "target_nfe_values": nfes, "forecast_datasets": parse_forecast_datasets(str(cli_args.forecast_datasets)), "lob_datasets": parse_lob_datasets(str(cli_args.lob_datasets)), "backbone_manifest": manifest_summary, "dataset_bundle": getattr(cli_args, "_dataset_bundle_resolution", None), "allow_execute": bool(getattr(cli_args, "allow_execute", False))}
 
 
 def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Run diffusion-flow time reparameterization fixed-schedule evaluations.")
     ap.add_argument("--out_root", type=str, default=str(DEFAULT_OUT_ROOT))
     ap.add_argument("--dataset_root", type=str, default=str(project_paper_dataset_root()))
+    ap.add_argument("--dataset_bundle_zip", type=str, default="")
+    ap.add_argument("--dataset_bundle_extract_root", type=str, default=str(DEFAULT_DATASET_BUNDLE_EXTRACT_ROOT))
+    ap.add_argument("--dataset_bundle_mode", type=str, choices=("auto", "extract", "none"), default="auto")
     ap.add_argument("--shared_backbone_root", type=str, default=str(DEFAULT_SHARED_BACKBONE_ROOT))
     ap.add_argument("--backbone_manifest", type=str, default=str(default_backbone_manifest_path()))
     ap.add_argument("--otflow_train_steps", type=int, default=20000)
@@ -496,6 +579,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def run_diffusion_flow_time_reparameterization(cli_args: argparse.Namespace) -> Dict[str, Any]:
+    cli_args = _apply_dataset_bundle(cli_args)
     out_root = Path(str(cli_args.out_root)).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
     prep_payload = _prep_summary(cli_args)
