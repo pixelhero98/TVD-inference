@@ -13,7 +13,7 @@ Diffusion-Flow-Inference evaluates optimized diffusion schedules after mapping t
 
 ## Data, Outputs, And Backbones
 
-This repository is source-only. Local runs may use `data/`, `paper_datasets/`, `outputs/`, and `.venv/`, but those large or machine-local directories are intentionally ignored and are not part of the public source tree.
+This repository is source-only. Local runs may use `data/`, `paper_datasets/`, `outputs/`, and a virtual environment such as `.venv/`, but those large or machine-local directories are intentionally ignored and are not part of the public source tree.
 
 Generated outputs default to:
 
@@ -27,7 +27,7 @@ The default backbone manifest path is:
 outputs/backbone_matrix/backbone_manifest.json
 ```
 
-A prepared local backbone matrix should report 40 ready checkpoint artifacts and 0 missing artifacts.
+If you have a prepared local backbone matrix, it should report 40 ready checkpoint artifacts and 0 missing artifacts. The public smoke tests do not require those private/local artifacts.
 
 ## Environment
 
@@ -47,13 +47,15 @@ Raw medical dataset preparation requires `OTFLOW_MEDICAL_STAGING_ROOT` to point 
 
 ## CPU Smoke Checks
 
+Run the public, artifact-independent smoke tests from `code/` with your active Python environment:
+
 ```bash
 cd code
-CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 ../.venv/bin/python -m unittest -q test_backbone_matrix test_otflow_paper_prep test_ptg_observed_gain_figure test_adaptive_solver_matched_nfe_study
+CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 python -m unittest -q test_backbone_matrix test_otflow_paper_prep test_ptg_observed_gain_figure test_adaptive_solver_matched_nfe_study test_hardness_mismatch_figure
 ```
 
-Dry-run prep from either the repository root or `code/` accepts the same project-relative manifest path:
+If you have local datasets and backbone artifacts, dry-run prep from either the repository root or `code/` accepts the same project-relative manifest path:
 
 ```bash
-CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 .venv/bin/python code/diffusion_flow_time_reparameterization.py --forecast_datasets '' --lob_datasets '' --backbone_manifest outputs/backbone_matrix/backbone_manifest.json
+CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 python code/diffusion_flow_time_reparameterization.py --forecast_datasets '' --lob_datasets '' --backbone_manifest outputs/backbone_matrix/backbone_manifest.json
 ```
