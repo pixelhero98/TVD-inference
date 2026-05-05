@@ -49,7 +49,7 @@ conda env create -f environment.conda.yml
 
 Raw medical dataset preparation requires `OTFLOW_MEDICAL_STAGING_ROOT` to point at the local staging directory. For the public review subset, download the processed bundle from Hugging Face and pass it to the evaluation runner.
 
-## CPU Smoke Checks
+## CPU Fast Checks
 
 Run the public, artifact-independent smoke tests with your active Python environment:
 
